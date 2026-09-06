@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "kind": "repo-preflight-disposition",
+  "identity": "github.com/jchidley/zwift-offline",
+  "decision": "no-change-required",
+  "reviewedCommit": "832dadc39daa673bdd8cf1f59a44a2ca8eea0947",
+  "operation": "inspect",
+  "files": {
+    "README.md": "c9f1c5115581f1bacb5ad0550bbb6fdc67df6344678b2043fe6e44d5e5911f77"
+  },
+  "profileId": "4e2f946311539a962f68da645c3a22ac068d8be0022fc08f8ed3cae14331fcc2",
+  "reviewer": "controller-pi-session-01a07795-640e-7529-b8bf-bbdc58622b3e",
+  "summary": "Current reviewed guidance scope requires no repository-local change.",
+  "evidenceSummary": [
+    "Retain no-local-surface: 132-entry server/protobuf/storage/CDN tree and complete README establish a Zwift emulator with optional game bots/Discord bridge, not an LLM integration. Certificates, hosts/DNS, credentials, port binding, external uploads and device/client patching are consequential product operations, not authority granted by reading the README. None was run; no service/security validation claim.",
+    "Account-wide rollout identity, source scope, disposition, and validation evidence were reconciled."
+  ],
+  "limitations": [
+    "Prior semantic findings retained as historical evidence, not independently re-certified by this verification pass."
+  ],
+  "recordedAt": "2026-09-06T22:49:05.494Z",
+  "publicationApproved": false
+}

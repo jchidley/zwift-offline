@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from Crypto.Cipher import AES
 
 import zwift_offline as zo
+import peloton
 import udp_node_msgs_pb2
 import tcp_node_msgs_pb2
 import profile_pb2
@@ -85,6 +86,7 @@ global_ghosts = {}
 online = {}
 global_pace_partners = {}
 global_bots = {}
+peloton_manager = None
 global_news = {} #player id to dictionary of peer_player_id->worldTime
 global_relay = {}
 global_clients = {}
@@ -271,12 +273,12 @@ class TCPHandler(socketserver.BaseRequestHandler):
         details1 = msg.udp_config.relay_addresses.add()
         details1.lb_realm = udp_node_msgs_pb2.ZofflineConstants.RealmID
         details1.lb_course = 6 # watopia crowd
-        details1.ip = zo.server_ip
+        details1.ip = self.request.getpeername()[0] if self.request.getpeername()[0] in ['127.0.0.1', '::1'] else zo.server_ip
         details1.port = 3022
         details2 = msg.udp_config.relay_addresses.add()
         details2.lb_realm = 0 #generic load balancing realm
         details2.lb_course = 0 #generic load balancing course
-        details2.ip = zo.server_ip
+        details2.ip = self.request.getpeername()[0] if self.request.getpeername()[0] in ['127.0.0.1', '::1'] else zo.server_ip
         details2.port = 3022
         msg.udp_config.uc_f2 = 10
         msg.udp_config.uc_f3 = 30
@@ -444,14 +446,11 @@ def regroup_ghosts(player_id):
     if not ghosts.started and ghosts.play:
         ghosts.started = True
     for g in ghosts.play:
-        states = [(s.roadTime, s.distance) for s in g.route.states if zo.road_id(s) == zo.road_id(p) and zo.is_forward(s) == zo.is_forward(p)]
-        if states:
-            c = min(states, key=lambda x: sum(abs(r - d) for r, d in zip((p.roadTime, p.distance), x)))
-            g.position = 0
-            while g.route.states[g.position].roadTime != c[0] or g.route.states[g.position].distance != c[1]:
-                g.position += 1
-            if is_ahead(p, g.route.states[g.position].roadTime):
-                g.position += 1
+        n = zo.nearest(p, g)
+        if n != None:
+            if is_ahead(p, g.route.states[n].roadTime):
+                n += 1
+            g.position = n
     ghosts.last_play = 0
 
 def load_pace_partners():
@@ -466,6 +465,7 @@ def load_pace_partners():
                     global_pace_partners[p.id] = BotVariables()
                     pp = global_pace_partners[p.id]
                     pp.profile = p
+                    pp.folder = d
                 with open(route, 'rb') as fd:
                     pp.route = udp_node_msgs_pb2.Ghost()
                     pp.route.ParseFromString(fd.read())
@@ -479,6 +479,8 @@ def play_pace_partners():
             if pp.position < len(pp.route.states) - 1: pp.position += 1
             else: pp.position = 0
             pp.route.states[pp.position].id = pp_id
+        if peloton_manager:
+            peloton_manager.tick(pacer_update_freq)
         pause = pacer_update_freq - (time.perf_counter() - start)
         if pause > 0: time.sleep(pause)
 
@@ -688,6 +690,8 @@ class UDPHandler(socketserver.BaseRequestHandler):
         elif state.watchingRiderId in global_pace_partners.keys():
             pp = global_pace_partners[state.watchingRiderId]
             watching_state = pp.route.states[pp.position]
+        elif state.watchingRiderId in zo.global_peloton_bots.keys():
+            watching_state = zo.global_peloton_bots[state.watchingRiderId].route.states[0]
         elif state.watchingRiderId in global_bots.keys():
             bot = global_bots[state.watchingRiderId]
             watching_state = bot.route.states[bot.position]
@@ -711,6 +715,11 @@ class UDPHandler(socketserver.BaseRequestHandler):
             for p_id in global_pace_partners.keys():
                 pp = global_pace_partners[p_id]
                 is_nearby, distance = nearby_distance(watching_state, pp.route.states[pp.position])
+                if is_nearby:
+                    nearby[p_id] = distance
+            peloton_bots = zo.global_peloton_bots
+            for p_id in peloton_bots.keys():
+                is_nearby, distance = nearby_distance(watching_state, peloton_bots[p_id].route.states[0])
                 if is_nearby:
                     nearby[p_id] = distance
         if t >= last_bot_updates[player_id] + bot_update_freq:
@@ -752,6 +761,8 @@ class UDPHandler(socketserver.BaseRequestHandler):
             elif p_id in global_pace_partners.keys():
                 pp = global_pace_partners[p_id]
                 player = pp.route.states[pp.position]
+            elif p_id in zo.global_peloton_bots.keys():
+                player = zo.global_peloton_bots[p_id].route.states[0]
             elif p_id in global_bots.keys():
                 bot = global_bots[p_id]
                 player = bot.route.states[bot.position]
@@ -781,8 +792,19 @@ class UDPHandler(socketserver.BaseRequestHandler):
             relay.udp_t_sn += 1
             socket.sendto(r, client_address)
 
+def publish_peloton_bots(followers):
+    zo.global_peloton_bots = followers
+
+def forget_peloton_profiles(player_ids):
+    for player_id in player_ids:
+        zo.player_partial_profiles.pop(player_id, None)
+
 if os.path.isdir(PACE_PARTNERS_DIR):
     load_pace_partners()
+    peloton_manager = peloton.PelotonManager(STORAGE_DIR, global_pace_partners, get_names, zo.GD, zo.world_time,
+        publish_peloton_bots, forget_peloton_profiles, zo.logger)
+    peloton_manager.load()
+    zo.peloton_manager = peloton_manager
     pp = threading.Thread(target=play_pace_partners)
     pp.start()
 
@@ -791,23 +813,30 @@ if os.path.isfile(ENABLE_BOTS_FILE):
     bot = threading.Thread(target=play_bots)
     bot.start()
 
+SERVER_HOST = os.environ.get('ZOFFLINE_SERVER_HOST', '')
+if ':' in SERVER_HOST:
+    import socket
+    socketserver.ThreadingTCPServer.address_family = socket.AF_INET6
+    socketserver.ThreadingUDPServer.address_family = socket.AF_INET6
+
 socketserver.ThreadingTCPServer.allow_reuse_address = True
-cdn_host = os.environ.get('ZOFFLINE_CDN_HOST', '')
+socketserver.ThreadingUDPServer.allow_reuse_address = True
+
+cdn_host = os.environ.get('ZOFFLINE_CDN_HOST', SERVER_HOST)
 cdn_port = int(os.environ.get('ZOFFLINE_CDN_PORT', 80))
 httpd = socketserver.ThreadingTCPServer((cdn_host, cdn_port), CDNHandler)
 zoffline_thread = threading.Thread(target=httpd.serve_forever)
 zoffline_thread.daemon = True
 zoffline_thread.start()
 
-tcp_host = os.environ.get('ZOFFLINE_TCP_HOST', '')
+tcp_host = os.environ.get('ZOFFLINE_TCP_HOST', SERVER_HOST)
 tcp_port = int(os.environ.get('ZOFFLINE_TCP_PORT', 3025))
 tcpserver = socketserver.ThreadingTCPServer((tcp_host, tcp_port), TCPHandler)
 tcpserver_thread = threading.Thread(target=tcpserver.serve_forever)
 tcpserver_thread.daemon = True
 tcpserver_thread.start()
 
-socketserver.ThreadingUDPServer.allow_reuse_address = True
-udp_host = os.environ.get('ZOFFLINE_UDP_HOST', '')
+udp_host = os.environ.get('ZOFFLINE_UDP_HOST', SERVER_HOST)
 udp_port = int(os.environ.get('ZOFFLINE_UDP_PORT', 3024))
 udpserver = socketserver.ThreadingUDPServer((udp_host, udp_port), UDPHandler)
 udpserver_thread = threading.Thread(target=udpserver.serve_forever)

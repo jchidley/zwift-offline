@@ -16,7 +16,7 @@ There are four ways with which to install and run zoffline depending on your pla
 <details><summary>Simplest (Windows only)</summary>
 To install zoffline on Windows:
 
-* Download the latest zoffline release from https://github.com/zoffline/zwift-offline/releases/latest
+* Download the latest zoffline release from https://github.com/fatsbrown/zwift-offline/releases/latest
 * If you are not running zoffline on the same PC that Zwift is running: create a ``server-ip.txt`` file in the ``storage`` directory containing the IP address of the PC running zoffline.
 * Run the downloaded zoffline.exe
   * Once run, zoffline will create a ``storage`` directory in the same folder it's in to store your Zwift progress.
@@ -53,7 +53,7 @@ zoffline can be installed on the same machine as Zwift or another local machine.
  
 * Install Docker
 * Create the docker container with:<br>
-  ``docker create --name zwift-offline -p 443:443 -p 80:80 -p 3024:3024/udp -p 3025:3025 -p 53:53/udp -v </path/to/host/storage>:/usr/src/app/zwift-offline/storage -e TZ=<timezone> zoffline/zoffline``
+  ``docker create --name zwift-offline -p 443:443 -p 80:80 -p 3024:3024/udp -p 3025:3025 -p 53:53/udp -v </path/to/host/storage>:/usr/src/app/zwift-offline/storage -e TZ=<timezone> ghcr.io/fatsbrown/zoffline``
   * You can optionally exclude ``-v </path/to/host/storage>:/usr/src/app/zwift-offline/storage`` if you don't care if your Zwift progress state is retained across zoffline updates (unlikely).
   * The path you pass to ``-v`` will likely need to be world readable and writable.
   * A list of valid ``<timezone>`` values (e.g. America/New_York) can be found [here](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).
@@ -71,7 +71,7 @@ zoffline can be installed on the same machine as Zwift or another local machine.
   ``` yaml
   services:
       zoffline:
-          image: zoffline/zoffline:latest
+          image: ghcr.io/fatsbrown/zoffline:latest
           container_name: zoffline
           environment:
               - TZ=Europe/London
@@ -152,6 +152,7 @@ to generate your own certificates and do the same.
 * Patch after every installation or update:
   * Install/update Zwift from Google play, but do not start it yet.
     * If you have already started it go to `Android Settings > Applications > Zwift` and clear data or uninstall and reinstall the app.
+  * __NOTE:__ ZofflineObb doesn't work on Android 15 and later versions. As a workaround, you can patch the OBB file on Windows. See [#505](https://github.com/zoffline/zwift-offline/issues/505) for details.
   * Open the `ZofflineObb` app and run it (allow access to storage)
   * Wait for process to finish (5-10min)
   * Run Zwift, hopefully it verifies download and runs
@@ -222,24 +223,26 @@ To obtain your current profile:
 
 <details><summary>Strava</summary>
 
-* Get CLIENT_ID and CLIENT_SECRET from https://www.strava.com/settings/api
-* __NOTE:__ instead of performing the steps below you can instead set the authorization callback domain of your API application to ``launcher.zwift.com`` and use the "Settings - Strava" button in the launcher window (Windows and macOS only).
-* Run ``scripts/strava_auth.py --client-id CLIENT_ID --client-secret CLIENT_SECRET``
-  * Or, if using the Windows zoffline.exe version without Python installed you can run ``strava_auth.exe`` obtained from https://github.com/oldnapalm/zoffline-helper/releases/latest in place of ``scripts/strava_auth.py``
-* Open http://localhost:8000/ and authorize.
-* Move the resulting ``strava_token.txt`` (saved in whatever directory you ran ``strava_auth.py`` in) into the ``storage/1`` directory.
-* Automatic screenshots upload is not possible, see [#28](https://github.com/zoffline/zwift-offline/issues/28) for details.
+* Two upload methods are available and can be selected on the "Settings - Strava" page of the launcher (if using Android, access ``https://<zoffline_ip>/strava/zoffline/``):
+  * __API application (requires an active paid subscription):__
+    * Get CLIENT_ID and CLIENT_SECRET from https://www.strava.com/settings/api
+    * __NOTE:__ instead of performing the steps below you can instead set the authorization callback domain of your API application to ``launcher.zwift.com`` and use the "Settings - Strava" page of the launcher (Windows and macOS only).
+    * Run ``scripts/strava_auth.py --client-id CLIENT_ID --client-secret CLIENT_SECRET``
+      * Or, if using the Windows zoffline.exe version without Python installed you can run ``strava_auth.exe`` obtained from https://github.com/oldnapalm/zoffline-helper/releases/latest in place of ``scripts/strava_auth.py``
+    * Open http://localhost:8000/ and authorize.
+    * Move the resulting ``strava_token.txt`` (saved in whatever directory you ran ``strava_auth.py`` in) into the ``storage/1`` directory.
+  * __Browser session cookie (free):__
+    * Log in to https://www.strava.com in a browser, open the developer tools (F12), navigate to "Application - Storage - Cookies" and copy the ``_strava4_session`` cookie value.
+    * Paste and save the value on the "Settings - Strava" page of the launcher.
+* Automatic screenshots uploading works with the session cookie method, but not with the API. See [#28](https://github.com/zoffline/zwift-offline/issues/28) for details.
 
 </details>
 
 <details><summary>Garmin Connect</summary>
 
-* If running from source, install garth: ``pip install garth``
-* If needed, create a file ``garmin_domain.txt`` in the ``storage`` directory containing the domain
-  * For China use ``garmin.cn``
-* Use the "Settings - Garmin" button in the launcher window to enter your credentials (if using Android, access ``https://<zoffline_ip>/garmin/zoffline/``).
-* If your account has multi-factor authentication, run the script ``garmin_auth.py`` and move the resulting ``garth`` folder (saved in whatever directory you ran ``garmin_auth.py`` in) into the ``storage/1`` directory.
-  * Or, if using the Windows zoffline.exe version without Python installed you can run ``garmin_auth.exe`` obtained from https://github.com/oldnapalm/zoffline-helper/releases/latest instead.
+* __NOTE:__ Garmin Connect login is no longer supported ([matin/garth#222](https://github.com/matin/garth/discussions/222)).
+* Use [this script](https://gist.github.com/coleman8er/5c8e192d2aa3c8a3a6220c5702e8a5e6) to login and save tokens.
+* Move the resulting ``oauth1_token.json`` and ``oauth2_token.json`` from `~/.garth` (`C:\Users\<username>\.garth`) to `storage/1/garth`.
 
 </details>
 
@@ -254,26 +257,7 @@ To obtain your current profile:
 
 <details><summary>Android (non-rooted device)</summary>
 
-* Install apk-mitm (https://github.com/shroudedcode/apk-mitm)
-* Open ``apk-mitm/dist/tools/apktool.js`` (run ``npm root -g`` to find its location) and edit it like this:
-  ``` js
-      decode(inputPath, outputPath) {
-          return this.run([
-              'decode',
-              '-resm', // add this
-              'dummy', // add this
-              inputPath,
-              '--output',
-              outputPath,
-              '--frame-path',
-              this.options.frameworkPath,
-          ], 'decoding');
-      }
-  ```
-* Copy the file [ssl/cert-zwift-com.pem](https://github.com/zoffline/zwift-offline/raw/master/ssl/cert-zwift-com.pem) in this repo and the Zwift Companion apk (e.g. ``zca.apk``) to a known location
-* Open Command Prompt, cd to that location and run
-  * ``apk-mitm --certificate cert-zwift-com.pem zca.apk``
-* Copy ``zca-patched.apk`` to your phone and install it
+* Download and install the patched apk from [here](https://github.com/fatsbrown/zoffline-companion/releases/latest) (or [patch it yourself](https://github.com/fatsbrown/zoffline-companion#patch-it-yourself))
 * Download and install ``app-Github-release.apk`` from [here](https://github.com/x-falcon/Virtual-Hosts/releases/latest)
 * Create a ``hosts.txt`` file to use with the app (you could use a text editor app or create it online with an online tool such as [this](https://passwordsgenerator.net/text-editor/)). The file must look like this (replace ``<zoffline ip>`` with the IP address of the machine running zoffline):
   ```
@@ -305,6 +289,10 @@ To enable support for multiple users perform the steps below:
 
 </details>
 
+### Step 7 [OPTIONAL]: Enable IPv6
+
+To enable support for IPv6 set the environment variable ``ZOFFLINE_SERVER_HOST`` or use the script ``run_ipv6.bat``.
+
 ### Extra features
 
 <details><summary>Ghosts</summary>
@@ -319,6 +307,7 @@ To enable support for multiple users perform the steps below:
 
 * Create a file ``enable_bots.txt`` inside the ``storage`` folder to load ghosts as bots, they will keep riding around regardless of the route you are riding.
 * Optionally, ``enable_bots.txt`` can contain a multiplier value (be careful, if the resulting number of bots is too high, it may cause performance issues or not work at all).
+* Type ``.group`` in chat to group the bots, or ``.groupall`` to include duplicates (if using multiplier). Type ``.autogroup`` or ``.autogroupall`` to automatically group whenever you change roads. Type ``.stopautogroup`` to stop automatic grouping, or ``.disperse`` to randomize positions.
 * Names, nationalities and equipment can be customized by creating a file ``bot.txt`` inside the ``storage`` folder. The script ``get_pro_names.py`` can be used to populate this file.
 * If you want some random bots, check [this repository](https://github.com/oldnapalm/zoffline-bots).
 </details>
@@ -331,6 +320,44 @@ To enable support for multiple users perform the steps below:
 * The profile must contain a unique player ID and the route ID, so that when you join the bot you take the same turns at intersections.
 * The script ``bot_editor.py`` can be used to modify ``profile.bin`` (set name, player ID and route ID) and ``route.bin`` (cut the exceeding points to make a perfect loop).
 * If you want to create a dynamic RoboPacer (increase power on climbs and decrease on descents) you can use [standalone_power.py](https://github.com/oldnapalm/zwift-offline/blob/master/standalone_power.py) (requires 2 ANT sticks, [python-ant](https://github.com/mch/python-ant) and [PowerMeterTx.py](https://github.com/oldnapalm/zwift-offline/blob/master/PowerMeterTx.py)).
+</details>
+
+<details><summary>Pelotons (RoboPacer + follower bots)</summary>
+
+* A peloton is one RoboPacer followed by a custom group of bots riding in formation around and behind it, so joining the pacer feels like riding in a real group.
+* Followers move up and back inside the group, drift laterally, stretch out on climbs (weaker riders lose some meters and come back on the flat), coast on descents and show realistic power (drafting), cadence and heart rate.
+* Quick way: ride next to a RoboPacer and type ``.peloton 20`` in chat (``.peloton`` shows the current size, ``.peloton off`` removes it). This writes ``storage/peloton.txt``.
+* Or create ``storage/peloton.txt`` manually. ``pacer`` is the RoboPacer folder name (inside ``storage/robopacers``) or its player ID. Every other field is optional:
+
+```json
+{
+  "pelotons": [
+    {
+      "pacer": "B - 3.3 WKG - Watopia - Volcano Climb",
+      "bots": 25,
+      "columns": 0,
+      "row_gap": 2.2,
+      "lateral_spacing": 65000,
+      "beside_pacer": 2,
+      "dynamics": 1.0,
+      "shuffle_interval": 30,
+      "draft": 0.7,
+      "climb_stretch": 1.0,
+      "max_drop": 40,
+      "riders": [
+        {"first_name": "Tadej", "last_name": "Pogacar", "country_code": 705, "is_male": true, "position": "front", "strength": 1.3},
+        {"first_name": "Ana", "last_name": "Lopez", "is_male": false, "weight": 55, "position": "back", "strength": 0.85}
+      ]
+    }
+  ]
+}
+```
+
+* ``bots``: total followers (max 200). Riders not listed in ``riders`` get random names (from ``bot.txt`` if it exists) and random equipment.
+* ``columns``: max width of the group (0 = automatic). ``row_gap``: meters between rows. ``lateral_spacing``: lateral distance between riders in ``roadPosition`` units (100000 = 1 meter, default 0.65 m). ``beside_pacer``: riders alongside the pacer.
+* ``dynamics``: 0 = rigid formation, 1 = normal, 2 = very lively. ``shuffle_interval``: average seconds between position changes. ``draft``: fraction of power used by a rider on a wheel. ``climb_stretch`` and ``max_drop``: how much the group stretches on climbs.
+* Each rider in ``riders`` accepts the same fields as ``bot.txt`` plus ``position`` (``front``, ``middle``, ``back`` or ``any``), ``strength`` (0.5 - 1.5), ``weight`` (kg), ``height`` (cm), ``cadence`` (rpm) and ``max_heart_rate``.
+* The file is reloaded automatically when it changes (also with "Reload bots" in the launcher page). Set ``"enabled": false`` to disable a peloton without deleting it.
 </details>
 
 <details><summary>Bookmarks</summary>
@@ -421,10 +448,9 @@ Note: there is no guarantee that an untested Zwift update will work with zofflin
 Alternatively, [this script](https://gist.github.com/oldnapalm/556c58448a6ee09438b39e1c1c9ce3d0) can be used to downgrade Zwift to the version supported by zoffline.
 </details>
 
-<details><summary>Zwift phased updates</summary>
+<details><summary>Update failed during patching</summary>
 
-If you install Zwift during a phased update period, when you enable zoffline it's possible that Zwift attempts to update again and fails.
-To workaround this situation, rename the file ``Zwift_ver_cur.<version>.xml`` in Zwift directory to ``Zwift_ver_cur.xml`` and edit the file ``Zwift_ver_cur_filename.txt`` accordingly.
+If you get this error even though zoffline is up to date, rename the file ``Zwift_ver_cur.<version>.xml`` in Zwift directory to ``Zwift_ver_cur.xml`` and edit the file ``Zwift_ver_cur_filename.txt`` accordingly.
 </details>
 
 

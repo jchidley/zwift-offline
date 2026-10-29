@@ -9,7 +9,7 @@
   {
     "name": "Crit City - Downtown Dolphin",
     "route": 947394567,
-    "distance": 2032.6,
+    "distance": 2059.2,
     "course": 12,
     "sport": 0
   },
@@ -35,25 +35,46 @@
     "sport": 0
   },
   {
-    "name": "Gravel Mountain",
+    "name": "Gravel Mountain - Red Rock Loop",
     "route": 3687150686,
-    "distance": 5360.2,
+    "distance": 5396.2,
     "course": 16,
     "sport": 0
   },
   {
-    "name": "Gravel Mountain Reverse",
-    "route": 2956533021,
-    "distance": 5220.9,
+    "name": "Gravel Mountain - Red Rock Loop Arcade",
+    "route": 1295302121,
+    "distance": 5396.4,
     "course": 16,
     "sport": 0
   },
   {
-    "name": "Innsbruck KOM After Party",
-    "route": 3649347250,
-    "distance": 37196.9,
-    "course": 9,
+    "name": "Gravel Mountain - Red Rock Loop Arcade 3",
+    "route": 2273747093,
+    "distance": 5396.4,
+    "course": 16,
     "sport": 0
+  },
+  {
+    "name": "Gravel Mountain - Red Rock Loop Arcade 4",
+    "route": 434255158,
+    "distance": 5396.4,
+    "course": 16,
+    "sport": 0
+  },
+  {
+    "name": "Gravel Mountain - Red Rock Loop Reverse",
+    "route": 1437969615,
+    "distance": 5281.2,
+    "course": 16,
+    "sport": 0
+  },
+  {
+    "name": "Gravel Mountain - Red Rock Run",
+    "route": 967374265,
+    "distance": 5398.0,
+    "course": 16,
+    "sport": 1
   },
   {
     "name": "InnsbruckConti",
@@ -119,6 +140,13 @@
     "sport": 0
   },
   {
+    "name": "Makuri Islands - Liminal Loop",
+    "route": 334944296,
+    "distance": 23911.6,
+    "course": 13,
+    "sport": 0
+  },
+  {
     "name": "Makuri Islands - Neokyo Crit Course",
     "route": 1127056801,
     "distance": 4660.0,
@@ -128,7 +156,7 @@
   {
     "name": "New York - 2022 Cycling Esports World Championships Route",
     "route": 2436095601,
-    "distance": 54963.3,
+    "distance": 54964.1,
     "course": 8,
     "sport": 0
   },
@@ -149,14 +177,14 @@
   {
     "name": "New York - LaGuardia Loop",
     "route": 2422779354,
-    "distance": 4213.4,
+    "distance": 4213.3,
     "course": 8,
     "sport": 0
   },
   {
     "name": "New York - LaGuardia Loop Reverse",
     "route": 3774003351,
-    "distance": 5146.9,
+    "distance": 5146.1,
     "course": 8,
     "sport": 0
   },
@@ -189,6 +217,13 @@
     "sport": 0
   },
   {
+    "name": "Paris - Sacr\u00e9 Trois!",
+    "route": 764392844,
+    "distance": 27355.7,
+    "course": 15,
+    "sport": 0
+  },
+  {
     "name": "Richmond - Cobbled Climbs Reverse",
     "route": 4194352271,
     "distance": 9277.1,
@@ -196,10 +231,10 @@
     "sport": 0
   },
   {
-    "name": "Richmond Rollercoaster",
-    "route": 948831673,
-    "distance": 17203.8,
-    "course": 2,
+    "name": "Scotland - Glasgow Crit Six",
+    "route": 79243399,
+    "distance": 18318.8,
+    "course": 17,
     "sport": 0
   },
   {
@@ -210,9 +245,16 @@
     "sport": 0
   },
   {
+    "name": "Watopia - Better Lap Than Never",
+    "route": 4123597378,
+    "distance": 50413.4,
+    "course": 6,
+    "sport": 0
+  },
+  {
     "name": "Watopia - Big Loop Reverse",
     "route": 4107844490,
-    "distance": 42819.2,
+    "distance": 42812.3,
     "course": 6,
     "sport": 0
   },
@@ -247,7 +289,14 @@
   {
     "name": "Watopia - Hilly Route Reverse",
     "route": 107363867,
-    "distance": 9423.0,
+    "distance": 9406.9,
+    "course": 6,
+    "sport": 0
+  },
+  {
+    "name": "Watopia - Hot Laps",
+    "route": 2251715424,
+    "distance": 23473.8,
     "course": 6,
     "sport": 0
   },
@@ -287,9 +336,9 @@
     "sport": 1
   },
   {
-    "name": "Watopia - Seaside Sprint",
-    "route": 3454338139,
-    "distance": 9253.1,
+    "name": "Watopia - Spiral Summit",
+    "route": 159415549,
+    "distance": 24019.9,
     "course": 6,
     "sport": 0
   },
@@ -374,13 +423,6 @@
     "name": "Yorkshire - Harrogate Circuit Reverse",
     "route": 620436060,
     "distance": 13855.2,
-    "course": 11,
-    "sport": 0
-  },
-  {
-    "name": "Yorkshire Double Loop",
-    "route": 1788218813,
-    "distance": 29670.4,
     "course": 11,
     "sport": 0
   }

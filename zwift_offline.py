@@ -13,7 +13,6 @@ import math
 import threading
 import re
 import smtplib
-import ssl
 import requests
 import json
 import base64
@@ -26,12 +25,13 @@ from copy import deepcopy
 from functools import wraps
 from io import BytesIO
 from shutil import copyfile
-from urllib.parse import quote
 from flask import Flask, request, jsonify, redirect, render_template, url_for, flash, session, make_response, send_file, send_from_directory
 from flask_login import UserMixin, AnonymousUserMixin, LoginManager, login_user, current_user, login_required, logout_user
 from gevent.pywsgi import WSGIServer
+from gevent import ssl
 from google.protobuf.json_format import MessageToDict, Parse
 from flask_sqlalchemy import SQLAlchemy
+from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -39,6 +39,7 @@ from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 from collections import deque
 from itertools import islice
+from stravalib.client import Client
 
 sys.path.append(os.path.join(sys.path[0], 'protobuf')) # otherwise import in .proto does not work
 import udp_node_msgs_pb2
@@ -58,8 +59,16 @@ import events_pb2
 import variants_pb2
 import playback_pb2
 import user_storage_pb2
-import online_sync
 import fitness_pb2
+import structured_events_pb2
+
+import online_sync
+import intervals_workouts
+import trainingpeaks_workouts
+import workout_state
+import workouts_manifest
+import planned_workouts
+import free_strava
 
 logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO"))
 logger = logging.getLogger('zoffline')
@@ -101,16 +110,7 @@ if os.path.exists(SERVER_IP_FILE):
     with open(SERVER_IP_FILE, 'r') as f:
         server_ip = f.read().rstrip('\r\n')
 else:
-    import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('10.254.254.254', 1))
-        server_ip = s.getsockname()[0]
-    except:
-        server_ip = '127.0.0.1'
-    finally:
-        s.close()
-    logger.info("server-ip.txt not found, using %s", server_ip)
+    server_ip = '127.0.0.1'
 SECRET_KEY_FILE = "%s/secret-key.txt" % STORAGE_DIR
 ENABLEGHOSTS_FILE = "%s/enable_ghosts.txt" % STORAGE_DIR
 GHOST_PROFILE = None
@@ -141,13 +141,11 @@ if os.path.exists(GARMIN_DOMAIN_FILE):
         GARMIN_DOMAIN = f.readline().rstrip('\r\n')
 
 import warnings
-with warnings.catch_warnings():
-    from stravalib.client import Client
+warnings.simplefilter("ignore")
 
 from tokens import *
 
-# Android uses https for cdn
-app = Flask(__name__, static_folder='%s/cdn/gameassets' % SCRIPT_DIR, static_url_path='/gameassets', template_folder='%s/cdn/static/web/launcher' % SCRIPT_DIR)
+app = Flask(__name__, static_folder='%s/cdn/static' % SCRIPT_DIR, template_folder='%s/cdn/static/web/launcher' % SCRIPT_DIR)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///{db}'.format(db=DATABASE_PATH)
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 if not os.path.exists(SECRET_KEY_FILE):
@@ -155,7 +153,7 @@ if not os.path.exists(SECRET_KEY_FILE):
         f.write(os.urandom(16))
 with open(SECRET_KEY_FILE, 'rb') as f:
     app.config['SECRET_KEY'] = f.read()
-app.config['MAX_CONTENT_LENGTH'] = 4 * 1024 * 1024  # A typical .fit file with power, cadence, and heartrate data recorded in December 2024 is approximately 1.3 MB / 4 hours.
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 db = SQLAlchemy()
 db.init_app(app)
 
@@ -168,9 +166,13 @@ map_override = {}
 climb_override = {}
 global_bookmarks = {}
 global_race_results = {}
+zwift_online_tokens = {}
 restarting = False
 restarting_in_minutes = 0
 reload_pacer_bots = False
+global_peloton_bots = {} # follower bots of RoboPacer pelotons (see peloton.py)
+peloton_manager = None
+auto_group = {'id': None, 'road_id': None, 'is_forward': None, 'all': False, 'thread': None}
 
 with open(os.path.join(SCRIPT_DIR, "data", "climbs.txt")) as f:
     CLIMBS = json.load(f)
@@ -214,6 +216,7 @@ class AnonUser(User, AnonymousUserMixin, db.Model):
     first_name = "z"
     last_name = "offline"
     enable_ghosts = os.path.isfile(ENABLEGHOSTS_FILE)
+    is_admin = False
 
     def is_authenticated(self):
         return True
@@ -342,6 +345,7 @@ class GoalMetrics(db.Model):
     weekGoalTimeMinutes = db.Column(db.Integer)
     lastUpdated = db.Column(db.Text)
     currentGoalSetting = db.Column(db.Text)
+    currentGoalSource = db.Column(db.Text)
 
 class Playback(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -512,6 +516,8 @@ def get_partial_profile(player_id):
                 if f.id == 1766985504: #crc32 of "PACE PARTNER - ROUTE"
                     partial_profile.route = toSigned(f.number_value, 4) if f.number_value >= 0 else -toSigned(-f.number_value, 4)
                     break
+        elif player_id in global_peloton_bots.keys():
+            profile = global_peloton_bots[player_id].profile
         elif player_id in global_bots.keys():
             profile = global_bots[player_id].profile
         elif player_id > 10000000:
@@ -660,12 +666,12 @@ def login():
             db.session.commit()
             if not make_profile_dir(user.player_id):
                 return '', 500
-            return redirect(url_for("user_home", username=username, enable_ghosts=bool(user.enable_ghosts), online=get_online()))
+            return redirect(url_for("user_home", username=username))
         else:
             flash("Invalid username or password.")
 
     if current_user.is_authenticated and current_user.remember:
-        return redirect(url_for("user_home", username=current_user.username, enable_ghosts=bool(current_user.enable_ghosts), online=get_online()))
+        return redirect(url_for("user_home", username=current_user.username))
 
     user = User.verify_token(request.args.get('token'))
     if user:
@@ -790,19 +796,67 @@ def reset(username):
     return render_template("reset.html", username=current_user.username)
 
 
+def strava_upload_method(player_id):
+    file = '%s/%s/strava_upload_method.txt' % (STORAGE_DIR, player_id)
+    if not os.path.exists(file):
+        return 'paid'
+    with open(file) as f:
+        return f.readline().rstrip('\r\n')
+
+
 @app.route("/strava/<username>/", methods=["GET", "POST"])
 @login_required
 def strava(username):
     profile_dir = '%s/%s' % (STORAGE_DIR, current_user.player_id)
     api = '%s/strava_api.bin' % profile_dir
     token = os.path.isfile('%s/strava_token.txt' % profile_dir)
+    cookie_file = '%s/strava4_session.txt' % profile_dir
+    cookie = ''
+    if os.path.isfile(cookie_file):
+        with open(cookie_file) as f:
+            cookie = f.readline().rstrip('\r\n')
+    method = strava_upload_method(current_user.player_id)
     if request.method == "POST":
-        if request.form['client_id'] == "" or request.form['client_secret'] == "":
+        if '_strava4_session' in request.form:
+            if request.form['_strava4_session'] == "":
+                flash("Session cookie can't be empty.")
+            else:
+                cookie = request.form['_strava4_session']
+                with open(cookie_file, 'w') as f:
+                    f.write(cookie)
+                flash("Session cookie saved.")
+        elif 'method' in request.form:
+            if request.form['method'] in ('paid', 'free'):
+                method = request.form['method']
+                with open('%s/strava_upload_method.txt' % profile_dir, 'w') as f:
+                    f.write(method)
+                flash("Strava upload method saved.")
+        elif request.form['client_id'] == "" or request.form['client_secret'] == "":
             flash("Client ID and secret can't be empty.")
-            return render_template("strava.html", username=current_user.username, token=token)
-        encrypt_credentials(api, (request.form['client_id'], request.form['client_secret']))
+        else:
+            encrypt_credentials(api, (request.form['client_id'], request.form['client_secret']))
     cred = decrypt_credentials(api)
-    return render_template("strava.html", username=current_user.username, cid=cred[0], cs=cred[1], token=token)
+    return render_template("strava.html", username=current_user.username, cid=cred[0], cs=cred[1], token=token, cookie=cookie, method=method)
+
+
+@app.route("/strava/<username>/test", methods=["GET"])
+@login_required
+def strava_test(username):
+    cookie_file = '%s/%s/strava4_session.txt' % (STORAGE_DIR, current_user.player_id)
+    if not os.path.isfile(cookie_file):
+        flash("No session configured.")
+        return redirect(url_for('strava', username=current_user.username))
+    try:
+        with open(cookie_file) as f:
+            cookie = f.readline().rstrip('\r\n')
+        if free_strava.check_session(cookie):
+            flash("Session is valid.")
+        else:
+            flash("Session is not valid. Update the cookie.")
+    except Exception as exc:
+        logger.warning("strava_test: %s" % repr(exc))
+        flash("Could not reach Strava. Check your internet connection.")
+    return redirect(url_for('strava', username=current_user.username))
 
 
 @app.route("/strava_auth", methods=['GET'])
@@ -865,60 +919,312 @@ def backup_file(file):
     if os.path.isfile(file):
         copyfile(file, "%s-%s.bak" % (file, datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d-%H-%M-%S")))
 
+
+def save_player_zfile(player_id, folder, filename, content):
+    zfiles_dir = os.path.join(STORAGE_DIR, str(player_id), folder)
+    if not make_dir(zfiles_dir):
+        raise IOError("failed to create zfiles directory")
+    with open(os.path.join(zfiles_dir, filename), 'wb') as fd:
+        fd.write(content)
+    timestamp = int(time.time())
+    row = Zfile.query.filter_by(folder=folder, filename=filename, player_id=player_id).first()
+    if not row:
+        row = Zfile(folder=folder, filename=filename, timestamp=timestamp, player_id=player_id)
+        db.session.add(row)
+    else:
+        row.timestamp = timestamp
+    db.session.commit()
+    return row
+
+
+def update_workouts_manifest(player_id, folder, filename, content):
+    workouts_manifest.upsert_manifest_entry(os.path.join(STORAGE_DIR, str(player_id), folder), filename, content)
+    timestamp = int(time.time())
+    row = Zfile.query.filter_by(folder=folder, filename=workouts_manifest.MANIFEST_FILENAME, player_id=player_id).first()
+    if not row:
+        row = Zfile(folder=folder, filename=workouts_manifest.MANIFEST_FILENAME, timestamp=timestamp, player_id=player_id)
+        db.session.add(row)
+    else:
+        row.timestamp = timestamp
+    db.session.commit()
+    return row
+
+
+def remove_player_zfiles_by_prefix(player_id, folder, prefix):
+    rows = Zfile.query.filter_by(folder=folder, player_id=player_id)
+    removed = False
+    for row in rows:
+        if not row.filename.startswith(prefix):
+            continue
+        removed = True
+        try:
+            os.remove(os.path.join(STORAGE_DIR, str(row.player_id), row.folder, row.filename))
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning('remove_player_zfiles_by_prefix: %s' % repr(exc))
+        db.session.delete(row)
+    if removed:
+        db.session.commit()
+
+
+def load_workout_metadata(player_id, provider):
+    payload = workout_state.load_metadata(STORAGE_DIR, player_id, provider)
+    if payload is None:
+        return None
+    return payload
+
+
+def save_workout_metadata(player_id, provider, event, filename):
+    return workout_state.save_metadata(STORAGE_DIR, player_id, provider, event, filename)
+
+
+def clear_workout_metadata(player_id, provider):
+    workout_state.clear_metadata(STORAGE_DIR, player_id, provider)
+
+
+def load_intervals_workout_metadata(player_id):
+    return load_workout_metadata(player_id, 'intervals-icu')
+
+
+def clear_intervals_workout_metadata(player_id, event_id=None):
+    entries = workout_state.metadata_entries(load_intervals_workout_metadata(player_id))
+    removed = entries if event_id is None else [item for item in entries
+                                              if str(item.get('event_id')) == str(event_id)]
+    planned_workouts.remove_workouts(STORAGE_DIR, removed)
+    if event_id is None:
+        clear_workout_metadata(player_id, 'intervals-icu')
+    else:
+        workout_state.remove_metadata_entry(STORAGE_DIR, player_id, 'intervals-icu', event_id)
+
+
+def load_active_workout_provider(player_id):
+    return workout_state.load_active_provider(STORAGE_DIR, player_id)
+
+
+def save_active_workout_provider(player_id, provider):
+    workout_state.save_active_provider(STORAGE_DIR, player_id, provider)
+
+
+def available_workout_providers_for_player(player_id):
+    providers = set()
+    intervals_credentials = '%s/%s/intervals_credentials.bin' % (STORAGE_DIR, player_id)
+    if os.path.exists(intervals_credentials):
+        providers.add('intervals-icu')
+    if load_trainingpeaks_bridge_folder(player_id):
+        providers.add('trainingpeaks')
+    return providers
+
+
+def resolve_workout_provider_for_player(player_id):
+    return workout_state.resolve_active_provider(load_active_workout_provider(player_id), available_workout_providers_for_player(player_id))
+
+
+def managed_workout_prefixes(provider):
+    if provider == 'intervals-icu':
+        return {'intervals-icu-'}
+    if provider == 'trainingpeaks':
+        return {'trainingpeaks-'}
+    return set()
+
+
+def clear_managed_workouts_for_provider(player_id, provider, clear_metadata=True):
+    prefixes = managed_workout_prefixes(provider)
+    for prefix in prefixes:
+        remove_player_zfiles_by_prefix(player_id, 'customworkouts', prefix)
+    if prefixes and os.path.isfile(workouts_manifest.manifest_file(
+            os.path.join(STORAGE_DIR, str(player_id), 'customworkouts'))):
+        workouts_manifest.remove_prefixed_workouts(os.path.join(STORAGE_DIR, str(player_id), 'customworkouts'), prefixes)
+    if provider == 'intervals-icu' and clear_metadata:
+        clear_intervals_workout_metadata(player_id)
+
+
+def current_workout_sync_status(player_id, provider=None):
+    provider = provider or resolve_workout_provider_for_player(player_id)
+    if not provider:
+        return None
+    metadata = load_workout_metadata(player_id, provider)
+    if not workout_state.metadata_entries(metadata):
+        return {
+            'provider': provider,
+            'metadata': None,
+            'server_file_exists': False,
+        }
+    filename = metadata.get('filename')
+    cached = planned_workouts.cache_file(STORAGE_DIR, metadata.get('workout_id')) if provider == 'intervals-icu' else None
+    server_file = str(cached) if cached else ''
+    if not server_file and filename:
+        server_file = os.path.join(STORAGE_DIR, str(player_id), 'customworkouts', filename)
+    return {
+        'provider': provider,
+        'metadata': metadata,
+        'server_file_exists': bool(filename and os.path.exists(server_file)),
+        'server_file': server_file,
+    }
+
+
+def activate_workout_provider(player_id, provider):
+    save_active_workout_provider(player_id, provider)
+    if provider == 'intervals-icu':
+        clear_managed_workouts_for_provider(player_id, 'trainingpeaks', clear_metadata=False)
+    elif provider == 'trainingpeaks':
+        clear_managed_workouts_for_provider(player_id, 'intervals-icu')
+
+
+def sync_intervals_workout_for_player(player_id, timeout=30):
+    intervals_credentials = '%s/%s/intervals_credentials.bin' % (STORAGE_DIR, player_id)
+    if not os.path.exists(intervals_credentials):
+        return {"status": "missing_credentials", "message": "Intervals.icu credentials are not configured."}
+    athlete_id, api_key = decrypt_credentials(intervals_credentials)
+    if not athlete_id or not api_key:
+        return {"status": "missing_credentials", "message": "Intervals.icu credentials are incomplete."}
+
+    previous = workout_state.metadata_entries(load_intervals_workout_metadata(player_id))
+    by_event = {str(item.get('event_id')): item for item in previous}
+    activate_workout_provider(player_id, 'intervals-icu')
+    entries = []
+
+    def store_workout(_filename, content, event):
+        entries.append(planned_workouts.store_workout(
+            STORAGE_DIR, event, content, by_event.get(str(event['id']))))
+
+    try:
+        result = intervals_workouts.sync_workout(athlete_id, api_key, store_workout, timeout=timeout)
+        if result['status'] == 'no_workout':
+            clear_managed_workouts_for_provider(player_id, 'intervals-icu')
+            return {
+                **result,
+                'sync_status': current_workout_sync_status(player_id, 'intervals-icu'),
+                'message': 'No Intervals.icu workout found for today.',
+            }
+        if result['status'] == 'synced':
+            workout_state.save_metadata_collection(STORAGE_DIR, player_id, 'intervals-icu', entries)
+            planned_workouts.remove_workouts(STORAGE_DIR, previous, {item['workout_id'] for item in entries})
+            # Retire copies made by the former zfiles importer only after a
+            # successful import; other custom workouts stay in the library.
+            if any(row.filename.startswith('intervals-icu-') for row in
+                   Zfile.query.filter_by(player_id=player_id, folder='customworkouts')):
+                clear_managed_workouts_for_provider(player_id, 'intervals-icu', clear_metadata=False)
+                manifest = Zfile.query.filter_by(player_id=player_id, folder='customworkouts',
+                                                filename=workouts_manifest.MANIFEST_FILENAME).first()
+                if manifest:
+                    manifest.timestamp = int(time.time())
+                    db.session.commit()
+            sync_status = current_workout_sync_status(player_id, 'intervals-icu')
+            return {
+                **result,
+                'sync_status': sync_status,
+            }
+        return result
+    except Exception as exc:
+        logger.warning('sync_intervals_workout_for_player: %s' % repr(exc))
+        return {"status": "error", "message": "Intervals.icu workout sync failed."}
+
+
+def trainingpeaks_bridge_folder_file(player_id):
+    return os.path.join(STORAGE_DIR, str(player_id), 'trainingpeaks_bridge_folder.txt')
+
+
+def load_trainingpeaks_bridge_folder(player_id):
+    file = trainingpeaks_bridge_folder_file(player_id)
+    if not os.path.exists(file):
+        return ''
+    with open(file) as fd:
+        return fd.read().strip()
+
+
+def save_trainingpeaks_bridge_folder(player_id, folder):
+    file = trainingpeaks_bridge_folder_file(player_id)
+    with open(file, 'w') as fd:
+        fd.write(folder.strip())
+
+
+def sync_trainingpeaks_workout_for_player(player_id):
+    folder = load_trainingpeaks_bridge_folder(player_id)
+    if not folder:
+        return {
+            'status': 'missing_folder',
+            'message': 'Set a TrainingPeaks bridge folder first. Export .zwo workouts there, then sync again.',
+        }
+
+    activate_workout_provider(player_id, 'trainingpeaks')
+    clear_managed_workouts_for_provider(player_id, 'trainingpeaks', clear_metadata=False)
+
+    def store_workout(filename, content, workout):
+        save_player_zfile(player_id, 'customworkouts', filename, content)
+        update_workouts_manifest(player_id, 'customworkouts', filename, content)
+
+    try:
+        result = trainingpeaks_workouts.sync_exported_workouts(folder, store_workout)
+        if result['status'] == 'no_workout':
+            clear_managed_workouts_for_provider(player_id, 'trainingpeaks', clear_metadata=False)
+            return {
+                **result,
+                'message': 'No .zwo workouts were found in the TrainingPeaks bridge folder.',
+            }
+        return result
+    except Exception as exc:
+        logger.warning('sync_trainingpeaks_workout_for_player: %s' % repr(exc))
+        return {'status': 'error', 'message': 'TrainingPeaks bridge sync failed.'}
+
 @app.route("/profile/<username>/", methods=["GET", "POST"])
 @login_required
 def profile(username):
     profile_dir = os.path.join(STORAGE_DIR, str(current_user.player_id))
     file = os.path.join(profile_dir, 'zwift_credentials.bin')
     cred = decrypt_credentials(file)
+    upload = os.path.join(profile_dir, 'zwift_upload.txt')
+    click = os.path.join(profile_dir, 'zwift_click.txt')
     if request.method == "POST":
         if request.form['username'] == "" or request.form['password'] == "":
             flash("Zwift credentials can't be empty.")
             return render_template("profile.html", username=current_user.username)
-        if not request.form.get("zwift_profile") and not request.form.get("achievements") and not request.form.get("save_zwift"):
+        if not any ([request.form.get("zwift_profile"), request.form.get("achievements"), request.form.get("zwift_upload"), request.form.get("zwift_click")]):
             flash("Select at least one option.")
             return render_template("profile.html", username=current_user.username, uname=cred[0], passw=cred[1])
         username = request.form['username']
         password = request.form['password']
-        session = requests.session()
-        try:
-            access_token, refresh_token = online_sync.login(session, username, password)
+        with requests.session() as session:
             try:
-                if request.form.get("zwift_profile"):
-                    profile = online_sync.query(session, access_token, "api/profiles/me")
-                    profile_file = '%s/profile.bin' % profile_dir
-                    backup_file(profile_file)
-                    with open(profile_file, 'wb') as f:
-                        f.write(profile)
-                    login_request = login_pb2.LoginRequest()
-                    login_request.key = random.randbytes(16)
-                    login_response = login_pb2.LoginResponse()
-                    login_response.ParseFromString(online_sync.api_login(session, access_token, login_request))
-                    login_response_dict = MessageToDict(login_response, preserving_proto_field_name=True)
-                    if 'economy_config' in login_response_dict:
-                        economy_config_file = '%s/economy_config.txt' % profile_dir
-                        backup_file(economy_config_file)
-                        with open(economy_config_file, 'w') as f:
-                            json.dump(login_response_dict['economy_config'], f, indent=2)
-                if request.form.get("achievements"):
-                    achievements = online_sync.query(session, access_token, "achievement/loadPlayerAchievements")
-                    achievements_file = '%s/achievements.bin' % profile_dir
-                    backup_file(achievements_file)
-                    with open(achievements_file, 'wb') as f:
-                        f.write(achievements)
-                online_sync.logout(session, refresh_token)
-                if request.form.get("save_zwift"):
-                    encrypt_credentials(file, (username, password))
+                access_token, refresh_token = online_sync.login(session, username, password)
+                try:
+                    if request.form.get("zwift_profile"):
+                        profile = online_sync.query(session, access_token, "api/profiles/me")
+                        profile_file = '%s/profile.bin' % profile_dir
+                        backup_file(profile_file)
+                        with open(profile_file, 'wb') as f:
+                            f.write(profile)
+                        login_request = login_pb2.LoginRequest()
+                        login_request.key = random.randbytes(16)
+                        login_response = login_pb2.LoginResponse()
+                        login_response.ParseFromString(online_sync.api_login(session, access_token, login_request))
+                        login_response_dict = MessageToDict(login_response, preserving_proto_field_name=True)
+                        if 'economy_config' in login_response_dict:
+                            economy_config_file = '%s/economy_config.txt' % profile_dir
+                            backup_file(economy_config_file)
+                            with open(economy_config_file, 'w') as f:
+                                json.dump(login_response_dict['economy_config'], f, indent=2)
+                    if request.form.get("achievements"):
+                        achievements = online_sync.query(session, access_token, "achievement/loadPlayerAchievements")
+                        achievements_file = '%s/achievements.bin' % profile_dir
+                        backup_file(achievements_file)
+                        with open(achievements_file, 'wb') as f:
+                            f.write(achievements)
+                    online_sync.logout(session, refresh_token)
+                    if request.form.get("zwift_upload") or request.form.get("zwift_click"):
+                        encrypt_credentials(file, (username, password))
+                    save_option(request.form.get("zwift_upload"), upload)
+                    save_option(request.form.get("zwift_click"), click)
+                except Exception as exc:
+                    logger.warning('Zwift profile: %s' % repr(exc))
+                    flash("Error downloading profile.")
+                    return render_template("profile.html", username=current_user.username, uname=cred[0], passw=cred[1])
             except Exception as exc:
-                logger.warning('Zwift profile: %s' % repr(exc))
-                flash("Error downloading profile.")
-                return render_template("profile.html", username=current_user.username, uname=cred[0], passw=cred[1])
-        except Exception as exc:
-            logger.warning('online_sync.login: %s' % repr(exc))
-            flash("Invalid username or password.")
-            return render_template("profile.html", username=current_user.username)
+                logger.warning('online_sync.login: %s' % repr(exc))
+                flash("Invalid username or password.")
+                return render_template("profile.html", username=current_user.username)
         return redirect(url_for('settings', username=current_user.username))
-    return render_template("profile.html", username=current_user.username, uname=cred[0], passw=cred[1])
+    return render_template("profile.html", username=current_user.username, uname=cred[0], passw=cred[1], upload=os.path.isfile(upload), click=os.path.isfile(click))
 
 
 @app.route("/garmin/<username>/", methods=["GET", "POST"])
@@ -962,14 +1268,49 @@ def intervals(username):
         encrypt_credentials(file, (request.form['athlete_id'], request.form['api_key']))
         return redirect(url_for('settings', username=current_user.username))
     cred = decrypt_credentials(file)
-    return render_template("intervals.html", username=current_user.username, aid=cred[0], akey=cred[1])
+    return render_template("intervals.html", username=current_user.username, aid=cred[0], akey=cred[1],
+        sync_status=current_workout_sync_status(current_user.player_id, 'intervals-icu'))
+
+
+@app.route("/intervals/<username>/sync", methods=["GET"])
+@login_required
+def intervals_sync(username):
+    result = sync_intervals_workout_for_player(current_user.player_id)
+    flash(result['message'])
+    return redirect(url_for('intervals', username=current_user.username))
+
+
+@app.route("/trainingpeaks/<username>/", methods=["GET", "POST"])
+@login_required
+def trainingpeaks(username):
+    if request.method == 'POST':
+        save_trainingpeaks_bridge_folder(current_user.player_id, request.form['bridge_folder'])
+        flash('TrainingPeaks bridge folder saved.')
+        return redirect(url_for('trainingpeaks', username=current_user.username))
+    bridge_folder = load_trainingpeaks_bridge_folder(current_user.player_id)
+    return render_template("trainingpeaks.html", username=current_user.username,
+        message=trainingpeaks_workouts.PARTNER_ACCESS_MESSAGE, bridge_folder=bridge_folder)
+
+
+@app.route("/trainingpeaks/<username>/sync", methods=["GET"])
+@login_required
+def trainingpeaks_sync(username):
+    result = sync_trainingpeaks_workout_for_player(current_user.player_id)
+    flash(result['message'])
+    return redirect(url_for('trainingpeaks', username=current_user.username))
 
 
 @app.route("/user/<username>/")
 @login_required
 def user_home(username):
+    provider = resolve_workout_provider_for_player(current_user.player_id)
+    if provider == 'intervals-icu':
+        sync_intervals_workout_for_player(current_user.player_id)
+    elif provider == 'trainingpeaks':
+        sync_trainingpeaks_workout_for_player(current_user.player_id)
     return render_template("user_home.html", username=current_user.username, enable_ghosts=bool(current_user.enable_ghosts), climbs=CLIMBS,
-        online=get_online(), is_admin=current_user.is_admin, restarting=restarting, restarting_in_minutes=restarting_in_minutes)
+        online=get_online(), is_admin=current_user.is_admin, restarting=restarting, restarting_in_minutes=restarting_in_minutes,
+        active_workout_provider=provider, workout_sync_status=current_workout_sync_status(current_user.player_id))
 
 def enqueue_player_update(player_id, wa_bytes):
     if not player_id in player_update_queue:
@@ -1051,6 +1392,8 @@ def reload_bots():
     global reload_pacer_bots
     if bool(current_user.is_admin):
         reload_pacer_bots = True
+        if peloton_manager:
+            peloton_manager.request_reload()
     return redirect(url_for('user_home', username=current_user.username))
 
 
@@ -1079,9 +1422,8 @@ def settings(username):
 @app.route("/download", methods=["POST"])
 @login_required
 def download():
-    file = os.path.join(STORAGE_DIR, str(current_user.player_id), request.form['filename'])
-    if os.path.isfile(file):
-        return send_file(file, as_attachment=True)
+    profile_dir = os.path.join(STORAGE_DIR, str(current_user.player_id))
+    return send_from_directory(profile_dir, request.form['filename'], as_attachment=True)
 
 @app.route("/download/<int:player_id>/avatarLarge.jpg", methods=["GET"])
 def download_avatarLarge(player_id):
@@ -1095,7 +1437,7 @@ def download_avatarLarge(player_id):
 @login_required
 def delete(filename):
     credentials = ['zwift_credentials.bin', 'intervals_credentials.bin']
-    strava = ['strava_api.bin', 'strava_token.txt']
+    strava = ['strava_api.bin', 'strava_token.txt', 'strava4_session.txt']
     garmin = ['garmin_credentials.bin', 'garth/oauth1_token.json']
     if filename not in credentials + strava + garmin:
         return '', 403
@@ -1200,13 +1542,100 @@ def api_eventfeed():
 @app.route('/api/subscription/plan', methods=['GET'])
 @app.route('/api/quest/quests/all-quests', methods=['GET'])
 @app.route('/api/quest/quests/my-quests', methods=['GET'])
-@app.route('/api/workout/schedule/list', methods=['GET'])
 def api_empty_arrays():
     return jsonify([])
 
 @app.route('/api/assetcms/<path:path>', methods=['GET'])
 def api_assetcms(path):
+    if path == 'delivery/tenant/production/static/asset/client_config/zwift/asset-cms-shared-artifacts/assets/client_config/partner_name_map.json/download':
+        return jsonify({'intervalsicu': 'Intervals.icu'})
     return jsonify()
+
+def current_planned_workouts():
+    if request.args.get('sport', 'CYCLING').upper() != 'CYCLING':
+        return []
+    return planned_workouts_for_player(current_user.player_id)
+
+
+def current_planned_workout(workout_id=None):
+    return next((item for item in current_planned_workouts()
+                 if workout_id is None or item['id'] == workout_id), None)
+
+
+def planned_workouts_for_player(player_id):
+    if resolve_workout_provider_for_player(player_id) != 'intervals-icu':
+        return []
+    entries = workout_state.metadata_entries(load_intervals_workout_metadata(player_id))
+    result, seen = [], set()
+    for metadata in entries:
+        workout = planned_workouts.build_workout(
+            STORAGE_DIR, player_id, metadata,
+            lambda workout_id: 'https://cdn.zwift.com' + url_for(
+                'api_planned_workout_cdn_download', workout_id=workout_id))
+        if workout and workout['id'] not in seen:
+            seen.add(workout['id'])
+            result.append(workout)
+    return result
+
+
+def planned_workout_json(payload):
+    response = jsonify(payload)
+    response.headers['Cache-Control'] = 'private, no-store'
+    return response
+
+
+@app.route('/api/workout/schedule/list', methods=['GET'])
+@jwt_to_session_cookie
+@login_required
+def api_workout_schedule_list():
+    return planned_workout_json([workout['schedule'] for workout in current_planned_workouts()])
+
+
+@app.route('/api/head-unit-bff/game-home', methods=['GET'])
+@jwt_to_session_cookie
+@login_required
+def api_game_home():
+    workout = current_planned_workout()
+    return planned_workout_json(workout['home'] if workout else [])
+
+
+@app.route('/api/head-unit-bff/carousels/for-you', methods=['GET'])
+@jwt_to_session_cookie
+@login_required
+def api_for_you():
+    cards = [{
+        'recommendationType': 'workout', 'workoutUUID': workout['id'],
+        'workoutHash': None, 'assetUrl': workout['schedule']['workoutUri'],
+        'providerId': workout['schedule']['trainingProviderId'], 'provider': None,
+        'scheduleId': workout['schedule']['scheduleId'], 'score': 1.0,
+        'explanation': None, 'sourceData': None, 'source': 'SCHEDULED',
+        'sourceId': workout['schedule']['scheduleId'], 'ribbon': None,
+        'recommendedDurationMinutes': None,
+    } for workout in current_planned_workouts()]
+    return planned_workout_json(cards)
+
+
+@app.route('/api/workout/workouts/<workout_id>', methods=['GET'])
+@jwt_to_session_cookie
+@login_required
+def api_planned_workout(workout_id):
+    workout = current_planned_workout(workout_id)
+    if not workout:
+        return '', 404
+    return planned_workout_json(workout['schedule']['workoutSummary'])
+
+
+@app.route('/tp-workouts/intervalsicu/<uuid:workout_id>.zwo', methods=['GET'])
+def api_planned_workout_cdn_download(workout_id):
+    return send_from_directory(planned_workouts.cache_dir(STORAGE_DIR), str(workout_id) + '.zwo',
+                               mimetype='application/xml')
+
+
+@app.route('/api/head-unit-bff/<path:path>', methods=['GET'])
+def api_head_unit_bff(path):
+    if path == "carousels/home-challenges":
+        return jsonify({"items":[]})
+    return jsonify([])
 
 def activity_moving_time(activity):
     try:
@@ -1244,7 +1673,6 @@ def select_activities_json(player_id, limit, start_after=None, in_progress=True)
     return ret
 
 @app.route('/api/activity-feed/feed/', methods=['GET'])
-@app.route('/api/activity-feed-service-v2/feed/just-me', methods=['GET'])
 @jwt_to_session_cookie
 @login_required
 def api_activity_feed():
@@ -1252,14 +1680,26 @@ def api_activity_feed():
     feed_type = request.args.get('feedType')
     start_after = request.args.get('start_after_activity_id')
     profile_id = None
-    in_progress = False
-    if feed_type == 'JUST_ME' or request.path.endswith('just-me'):
+    in_progress = feed_type == 'PREVIEW'
+    if feed_type == 'JUST_ME':
         profile_id = current_user.player_id
     elif feed_type == 'OTHER_PROFILE':
         profile_id = int(request.args.get('profile_id'))
-    elif feed_type == 'PREVIEW':
-        in_progress = True
     # todo: FAVORITES, FOLLOWEES (showing all for now)
+    ret = select_activities_json(profile_id, limit, start_after, in_progress)
+    return jsonify(ret)
+
+@app.route('/api/activity-feed-service-v2/feed/<feed_type>', methods=['GET'])
+@app.route('/api/activity-feed-service-v2/feed/<feed_type>/<int:profile_id>', methods=['GET'])
+@jwt_to_session_cookie
+@login_required
+def api_activity_feed_service_v2(feed_type, profile_id=None):
+    limit = int(request.args.get('limit'))
+    start_after = request.args.get('start_after_activity_id')
+    in_progress = feed_type == 'preview'
+    if feed_type == 'just-me':
+        profile_id = current_user.player_id
+    # todo: favorites, followees (showing all for now)
     ret = select_activities_json(profile_id, limit, start_after, in_progress)
     return jsonify(ret)
 
@@ -1369,6 +1809,9 @@ def api_clubs_club_my_clubs_summary():
 @app.route('/api/scoring/current', methods=['GET'])
 @app.route('/api/game-asset-patching-service/manifest', methods=['GET'])
 @app.route('/api/workout/progress', methods=['POST'])
+@app.route('/api/power-curve/power-profile/proto', methods=['GET'])
+@app.route('/api/achievement/route-completion-achievements', methods=['GET'])  # TODO
+@app.route('/api/coach/public/plan-settings', methods=['GET'])
 def api_proto_empty():
     return '', 200
 
@@ -1387,6 +1830,19 @@ def api_gameinfo():
         r.mimetype = 'application/json'
         return r
 
+def sync_workout_at_game_login(player_id):
+    # Game login also runs when Android reuses a saved authentication token.
+    # Keep failures separate from authentication and leave other providers alone.
+    try:
+        if resolve_workout_provider_for_player(player_id) != 'intervals-icu':
+            return
+        result = sync_intervals_workout_for_player(player_id, timeout=(2, 3))
+        logger.info('Game login workout sync: player=%s status=%s',
+                    player_id, result.get('status', 'unknown'))
+    except Exception:
+        logger.warning('Game login workout sync failed for player %s; continuing login', player_id)
+
+
 @app.route('/api/users/login', methods=['POST'])
 @jwt_to_session_cookie
 @login_required
@@ -1394,6 +1850,8 @@ def api_users_login():
     req = login_pb2.LoginRequest()
     req.ParseFromString(request.stream.read())
     player_id = current_user.player_id
+    if 'android' in request.headers.get('User-Agent', '').lower():
+        sync_workout_at_game_login(player_id)
     global_relay[player_id] = Relay(req.key)
     ghosts_enabled[player_id] = current_user.enable_ghosts
 
@@ -1404,7 +1862,7 @@ def api_users_login():
     response.info.apis.trainingpeaks_url = "https://api.trainingpeaks.com"
     response.info.time = int(time.time())
     udp_node = response.info.nodes.nodes.add()
-    udp_node.ip = server_ip  # TCP telemetry server
+    udp_node.ip = request.remote_addr if request.remote_addr in ['127.0.0.1', '::1'] else server_ip  # TCP telemetry server
     udp_node.port = 3023
     response.relay_session_id = player_id
     response.expiration = 70
@@ -1460,6 +1918,15 @@ def logout_player(player_id):
     if player_id in global_bookmarks:
         global_bookmarks[player_id].clear()
         global_bookmarks.pop(player_id)
+    if player_id in zwift_online_tokens:
+        tokens = zwift_online_tokens[player_id]
+        if 'refresh_token' in tokens:
+            with requests.session() as session:
+                try:
+                    online_sync.logout(session, tokens['refresh_token'])
+                except Exception as exc:
+                    logger.warning("logout_player: %s" % repr(exc))
+        zwift_online_tokens.pop(player_id)
 
 @app.route('/api/users/logout', methods=['POST'])
 @jwt_to_session_cookie
@@ -1636,14 +2103,14 @@ def relay_race_event_starting_line_id(event_id):
 def api_zfiles():
     if request.headers['Source'] == 'zwift-companion':
         zfile = json.loads(request.stream.read())
-        zfile_folder = zfile['folder']
-        zfile_filename = zfile['name']
+        zfile_folder = secure_filename(zfile['folder'])
+        zfile_filename = secure_filename(zfile['name'])
         zfile_file = base64.b64decode(zfile['content'])
     else:
         zfile = zfiles_pb2.ZFileProto()
         zfile.ParseFromString(request.stream.read())
-        zfile_folder = zfile.folder
-        zfile_filename = zfile.filename
+        zfile_folder = secure_filename(zfile.folder)
+        zfile_filename = secure_filename(zfile.filename)
         zfile_file = zfile.file
     zfiles_dir = os.path.join(STORAGE_DIR, str(current_user.player_id), zfile_folder)
     if not make_dir(zfiles_dir):
@@ -1652,7 +2119,7 @@ def api_zfiles():
         zfile_filename = zfile_filename.decode('utf-8', 'ignore')
     except AttributeError:
         pass
-    with open(os.path.join(zfiles_dir, quote(zfile_filename, safe=' ')), 'wb') as fd:
+    with open(os.path.join(zfiles_dir, zfile_filename), 'wb') as fd:
         fd.write(zfile_file)
     row = Zfile.query.filter_by(folder=zfile_folder, filename=zfile_filename, player_id=current_user.player_id).first()
     if not row:
@@ -1691,7 +2158,7 @@ def api_zfiles_list():
 @login_required
 def api_zfiles_download(file_id):
     row = Zfile.query.filter_by(id=file_id).first()
-    zfile = os.path.join(STORAGE_DIR, str(row.player_id), row.folder, quote(row.filename, safe=' '))
+    zfile = os.path.join(STORAGE_DIR, str(row.player_id), row.folder, row.filename)
     if os.path.isfile(zfile):
         return send_file(zfile, as_attachment=True, download_name=row.filename)
     else:
@@ -1703,7 +2170,7 @@ def api_zfiles_download(file_id):
 def api_zfiles_delete(file_id):
     row = Zfile.query.filter_by(id=file_id).first()
     try:
-        os.remove(os.path.join(STORAGE_DIR, str(row.player_id), row.folder, quote(row.filename, safe=' ')))
+        os.remove(os.path.join(STORAGE_DIR, str(row.player_id), row.folder, row.filename))
     except Exception as exc:
         logger.warning('api_zfiles_delete: %s' % repr(exc))
     db.session.delete(row)
@@ -1716,9 +2183,11 @@ def api_zfiles_delete(file_id):
 def custom_style(filename):
     return send_from_directory('%s/cdn/style' % SCRIPT_DIR, filename)
 
-@app.route('/static/web/launcher/<path:filename>')
-def static_web_launcher(filename):
-    return send_from_directory('%s/cdn/static/web/launcher' % SCRIPT_DIR, filename)
+
+# Launcher 1.1.17 uses https for gameassets, redirect to http to enable proxy
+@app.route('/gameassets/<path:filename>')
+def gameassets(filename):
+    return redirect('http://cdn.zwift.com/gameassets/%s' % filename)
 
 
 @app.route('/api/telemetry/config', methods=['GET'])
@@ -1738,7 +2207,15 @@ def hvc_ingestion_service_batch():
 
 @app.route('/api/actions-service/structured-events/batch', methods=['POST'])
 def api_actions_service_structured_events_batch():
-    return '', 202
+    stream = request.stream.read()
+    #import blackboxprotobuf
+    #message, typedef = blackboxprotobuf.protobuf_to_json(stream)
+    #print(json.dumps(json.loads(message), indent=2))
+    req = structured_events_pb2.SaveStructuredEventRequest()
+    req.ParseFromString(stream)
+    res = structured_events_pb2.SaveStructuredEventResponse()
+    res.sequenceNumber = req.sequenceNumber
+    return res.SerializeToString(), 202
 
 
 def age(dob):
@@ -1801,7 +2278,8 @@ def update_entitlements(profile):
     e.id = -1
     e.status = profile_pb2.ProfileEntitlement.ProfileEntitlementStatus.ACTIVE
     if os.path.isfile('%s/unlock_entitlements.txt' % STORAGE_DIR) or os.path.isfile('%s/unlock_all_equipment.txt' % STORAGE_DIR):
-        ent = json.load(open('%s/data/entitlements.txt' % SCRIPT_DIR))
+        with open('%s/data/entitlements.txt' % SCRIPT_DIR) as f:
+            ent = json.load(f)
         entitlements = list(range(ent['first'], ent['last'] + 1))
         if os.path.isfile('%s/unlock_all_equipment.txt' % STORAGE_DIR):
             entitlements.extend(list(range(1, ent['first'])))
@@ -2186,6 +2664,8 @@ def api_profiles():
         else:
             if p_id in global_pace_partners.keys():
                 profile = global_pace_partners[p_id].profile
+            elif p_id in global_peloton_bots.keys():
+                profile = global_peloton_bots[p_id].profile
             elif p_id in global_bots.keys():
                 profile = global_bots[p_id].profile
             else:
@@ -2296,6 +2776,23 @@ def strava_upload(player_id, activity):
         logger.warning("Strava upload failed. No internet? %s" % repr(exc))
 
 
+def free_strava_upload(player_id, activity, photos):
+    file = '%s/%s/strava4_session.txt' % (STORAGE_DIR, player_id)
+    if not os.path.exists(file):
+        logger.info("strava4_session.txt missing, skip free Strava activity update")
+        return
+    try:
+        with open(file) as f:
+            cookie = f.readline().rstrip('\r\n')
+    except Exception as exc:
+        logger.warning("Failed to read %s. Skipping free Strava upload attempt: %s" % (file, repr(exc)))
+        return
+    try:
+        free_strava.upload_activity(cookie, activity.fit_filename, activity.fit, activity.name, photos=photos)
+    except Exception as exc:
+        logger.warning("Free Strava upload failed. No internet? %s" % repr(exc))
+
+
 def garmin_upload(player_id, activity):
     try:
         import garth
@@ -2309,22 +2806,11 @@ def garmin_upload(player_id, activity):
         if garth.client.oauth2_token.expired:
             garth.client.refresh_oauth2()
             garth.save(tokens_dir)
-    except:
-        garmin_credentials = '%s/%s/garmin_credentials.bin' % (STORAGE_DIR, player_id)
-        if not os.path.exists(garmin_credentials):
-            logger.info("garmin_credentials.bin missing, skip Garmin activity update")
-            return
-        username, password = decrypt_credentials(garmin_credentials)
-        try:
-            garth.login(username, password)
-            garth.save(tokens_dir)
-        except Exception as exc:
-            logger.warning("Garmin login failed: %s" % repr(exc))
-            return
+    except Exception as exc:
+        logger.warning("garmin_upload: %s" % repr(exc))
+        return
     try:
-        requests.post('https://connectapi.%s/upload-service/upload' % GARMIN_DOMAIN,
-            files={"file": (activity.fit_filename, BytesIO(activity.fit))},
-            headers={'authorization': str(garth.client.oauth2_token)})
+        garth.client.post("connectapi", "/upload-service/upload", api=True, files={"file": (activity.fit_filename, BytesIO(activity.fit))})
     except Exception as exc:
         logger.warning("Garmin upload failed. No internet? %s" % repr(exc))
 
@@ -2353,33 +2839,45 @@ def intervals_upload(player_id, activity):
         logger.info("intervals_credentials.bin missing, skip Intervals.icu activity update")
         return
     athlete_id, api_key = decrypt_credentials(intervals_credentials)
+    workout_metadata = load_intervals_workout_metadata(player_id)
     try:
-        from requests.auth import HTTPBasicAuth
-        url = 'http://intervals.icu/api/v1/athlete/%s/activities?name=%s' % (athlete_id, activity.name)
-        requests.post(url, files = {"file": BytesIO(activity.fit)}, auth = HTTPBasicAuth('API_KEY', api_key))
+        result = intervals_workouts.upload_activity(athlete_id, api_key, activity, workout_metadata=workout_metadata)
+        if result.get('paired') and result.get('paired_event_id') is not None:
+            clear_intervals_workout_metadata(player_id, result.get('paired_event_id'))
     except Exception as exc:
         logger.warning("Intervals.icu upload failed. No internet? %s" % repr(exc))
 
 
+def get_zwift_online_tokens(player_id):
+    if not player_id in zwift_online_tokens:
+        zwift_online_tokens[player_id] = {}
+    tokens = zwift_online_tokens[player_id]
+    if not 'access_token' in tokens or not tokens['access_token']:
+        tokens['access_token'] = None
+        zwift_credentials = "%s/%s/zwift_credentials.bin" % (STORAGE_DIR, player_id)
+        if os.path.isfile(zwift_credentials):
+            username, password = decrypt_credentials(zwift_credentials)
+            with requests.session() as session:
+                try:
+                    tokens['access_token'], tokens['refresh_token'] = online_sync.login(session, username, password)
+                except Exception as exc:
+                    logger.warning("get_zwift_online_tokens: %s" % repr(exc))
+    return tokens
+
 def zwift_upload(player_id, activity):
-    zwift_credentials = '%s/%s/zwift_credentials.bin' % (STORAGE_DIR, player_id)
-    if not os.path.exists(zwift_credentials):
-        logger.info("zwift_credentials.bin missing, skip Zwift activity update")
-        return
-    username, password = decrypt_credentials(zwift_credentials)
-    try:
-        session = requests.session()
-        access_token, refresh_token = online_sync.login(session, username, password)
-        activity.player_id = online_sync.get_player_id(session, access_token)
-        new_activity = activity_pb2.Activity()
-        new_activity.CopyFrom(activity)
-        new_activity.ClearField('id')
-        new_activity.ClearField('fit')
-        activity.id = online_sync.create_activity(session, access_token, new_activity)
-        online_sync.upload_activity(session, access_token, activity)
-        online_sync.logout(session, refresh_token)
-    except Exception as exc:
-        logger.warning("Zwift upload failed. No internet? %s" % repr(exc))
+    tokens = get_zwift_online_tokens(player_id)
+    if tokens['access_token'] and os.path.isfile("%s/%s/zwift_upload.txt" % (STORAGE_DIR, player_id)):
+        with requests.session() as session:
+            try:
+                activity.player_id = online_sync.get_player_id(session, tokens['access_token'])
+                new_activity = activity_pb2.Activity()
+                new_activity.CopyFrom(activity)
+                new_activity.ClearField('id')
+                new_activity.ClearField('fit')
+                activity.id = online_sync.create_activity(session, tokens['access_token'], new_activity)
+                online_sync.upload_activity(session, tokens['access_token'], activity)
+            except Exception as exc:
+                logger.warning("Zwift upload failed. No internet? %s" % repr(exc))
 
 
 def moving_average(iterable, n):
@@ -2434,12 +2932,16 @@ def save_ghost(player_id, name):
         with open(f, 'wb') as fd:
             fd.write(ghosts.rec.SerializeToString())
 
-def activity_uploads(player_id, activity):
-    strava_upload(player_id, activity)
+def activity_uploads(player_id, activity, photos):
+    if strava_upload_method(player_id) == 'free':
+        free_strava_upload(player_id, activity, photos)
+    else:
+        strava_upload(player_id, activity)
     garmin_upload(player_id, activity)
     runalyze_upload(player_id, activity)
     intervals_upload(player_id, activity)
     zwift_upload(player_id, activity)
+    logout_player(player_id)
 
 @app.route('/api/profiles/<int:player_id>/activities/<int:activity_id>', methods=['PUT', 'DELETE'])
 @jwt_to_session_cookie
@@ -2472,18 +2974,26 @@ def api_profiles_activities_id(player_id, activity_id):
         return response, 200
 
     create_power_curve(player_id, BytesIO(activity.fit))
-    save_fit(player_id, '%s - %s' % (activity_id, activity.fit_filename), activity.fit)
+    save_fit(player_id, '%s - %s' % (activity_id, secure_filename(activity.fit_filename)), activity.fit)
     if current_user.enable_ghosts:
-        save_ghost(player_id, quote(activity.name, safe=' '))
+        save_ghost(player_id, secure_filename(activity.name))
     if activity.sport == profile_pb2.Sport.CYCLING and activity.distanceInMeters >= 2000:
         update_streaks(player_id, activity)
+        player_update = udp_node_msgs_pb2.WorldAttribute()
+        player_update.server_realm = udp_node_msgs_pb2.ZofflineConstants.RealmID
+        player_update.wa_type = udp_node_msgs_pb2.WA_TYPE.PLAYER_FITNESS_METRICS_UPDATED
+        player_update.world_time_born = world_time()
+        player_update.world_time_expire = world_time() + 60000
+        player_update.timestamp = int(time.time() * 1000000)
+        enqueue_player_update(player_id, player_update.SerializeToString())
     # For using with upload_activity
     with open('%s/%s/last_activity.bin' % (STORAGE_DIR, player_id), 'wb') as f:
         f.write(stream)
+    photos = [path for img in ActivityImage.query.filter_by(player_id=player_id, activity_id=activity.id)
+              if os.path.exists(path := '%s/%s/images/%s.jpg' % (STORAGE_DIR, player_id, img.id))]
     # Upload in separate thread to avoid client freezing if it takes longer than expected
-    upload = threading.Thread(target=activity_uploads, args=(player_id, activity))
+    upload = threading.Thread(target=activity_uploads, args=(player_id, activity, photos))
     upload.start()
-    logout_player(player_id)
     return response, 200
 
 @app.route('/api/profiles/<int:receiving_player_id>/activities/0/rideon', methods=['POST']) #activity_id Seem to always be 0, even when giving ride on to ppl with 30km+
@@ -2890,7 +3400,7 @@ def fill_in_goal_progress(goal, player_id):
                     WHERE player_id = :p AND sport = :s
                     AND strftime('%s', start_date) >= strftime('%s', :f)
                     AND strftime('%s', start_date) <= strftime('%s', :l)"""
-    args = {"p": player_id, "s": goal.sport, "f": first_dt, "l": last_dt}
+    args = {"p": player_id, "s": goal.sport, "f": first_dt.isoformat(), "l": last_dt.isoformat()}
     if goal.type == goal_pb2.GoalType.DISTANCE:
         distance = db.session.execute(sqlalchemy.text('SELECT SUM(distanceInMeters) %s' % common_sql), args).first()[0]
         if distance:
@@ -3053,7 +3563,7 @@ def api_profiles_goals_id(player_id, goal_id):
 def api_tcp_config():
     infos = per_session_info_pb2.TcpConfig()
     info = infos.nodes.add()
-    info.ip = server_ip
+    info.ip = request.remote_addr if request.remote_addr in ['127.0.0.1', '::1'] else server_ip
     info.port = 3023
     return infos.SerializeToString(), 200
 
@@ -3134,6 +3644,9 @@ def relay_worlds_generic(server_realm=None, player_id=None):
             pace_partner_variables = global_pace_partners[p_id]
             pace_partner = pace_partner_variables.route.states[pace_partner_variables.position]
             add_player_to_world(pace_partner, course_world, is_pace_partner=True)
+        peloton_bots = global_peloton_bots
+        for p_id in peloton_bots.keys():
+            add_player_to_world(peloton_bots[p_id].route.states[0], course_world, is_bot=True)
         for p_id in global_bots.keys():
             bot_variables = global_bots[p_id]
             bot = bot_variables.route.states[bot_variables.position]
@@ -3160,8 +3673,12 @@ def load_bookmarks(player_id):
             for file in files:
                 if file.endswith('.bin'):
                     state = udp_node_msgs_pb2.PlayerState()
-                    with open(os.path.join(root, file), 'rb') as f:
-                        state.ParseFromString(f.read())
+                    try:
+                        with open(os.path.join(root, file), 'rb') as f:
+                            state.ParseFromString(f.read())
+                    except Exception as exc:
+                        logger.warning("load_bookmarks: %s" % repr(exc))
+                        continue
                     state.id = i + 9000000 + player_id % 1000 * 1000
                     bookmark = Bookmark()
                     bookmark.name = file[:-4]
@@ -3320,6 +3837,8 @@ def relay_worlds_id_players_id(server_realm, player_id):
         state.world = get_course(state)
         state.route = get_partial_profile(player_id).route
         return state.SerializeToString()
+    if player_id in global_peloton_bots.keys():
+        return global_peloton_bots[player_id].route.states[0].SerializeToString()
     if player_id in global_bots.keys():
         bot = global_bots[player_id]
         return bot.route.states[bot.position].SerializeToString()
@@ -3344,6 +3863,39 @@ def save_bookmark(state, name):
     with open(os.path.join(bookmarks_dir, name + '.bin'), 'wb') as f:
         f.write(state.SerializeToString())
 
+def nearest(p, b):
+    i = None
+    states = [(s.roadTime, s.distance) for s in b.route.states if road_id(s) == road_id(p) and is_forward(s) == is_forward(p)]
+    if states:
+        i = 0
+        n = min(states, key=lambda x: sum(abs(r - d) for r, d in zip((p.roadTime, p.distance), x)))
+        while b.route.states[i].roadTime != n[0] or b.route.states[i].distance != n[1]:
+            i += 1
+    return i
+
+def group_bots(state, including_duplicates):
+    for bot in global_bots.keys():
+        if bot % 1000000 < 10000 or including_duplicates:
+            n = nearest(state, global_bots[bot])
+            if n != None:
+                if including_duplicates:
+                    n += bot % 1000000 // 10000
+                    if n >= len(global_bots[bot].route.states):
+                        n -= len(global_bots[bot].route.states)
+                global_bots[bot].position = n
+
+def auto_group_bots():
+    while True:
+        if auto_group['id'] in online:
+            state = online[auto_group['id']]
+            if road_id(state) != auto_group['road_id'] or is_forward(state) != auto_group['is_forward']:
+                auto_group.update({'road_id': road_id(state), 'is_forward': is_forward(state)})
+                group_bots(state, auto_group['all'])
+        time.sleep(3)
+
+def is_admin(user):
+    return True if not MULTIPLAYER or user.player_id == 1 or user.is_admin else False
+
 @app.route('/relay/worlds/attributes', methods=['POST'])
 @jwt_to_session_cookie
 @login_required
@@ -3363,10 +3915,28 @@ def relay_worlds_attributes():
                 command = chat_message.message[1:]
                 if command == 'regroup':
                     regroup_ghosts(chat_message.player_id)
+                elif command in ['group', 'groupall'] and is_admin(current_user):
+                    group_bots(state, command == 'groupall')
+                elif command in ['autogroup', 'autogroupall'] and is_admin(current_user):
+                    auto_group.update({'id': chat_message.player_id, 'road_id': None, 'is_forward': None, 'all': command == 'autogroupall'})
+                    if auto_group['thread'] is None:
+                        auto_group['thread'] = threading.Thread(target=auto_group_bots)
+                        auto_group['thread'].start()
+                elif command in ['stopautogroup', 'disperse'] and is_admin(current_user):
+                    auto_group['id'] = None
+                    if command == 'disperse':
+                        for bot in global_bots.keys():
+                            global_bots[bot].position = random.randrange(len(global_bots[bot].route.states))
+                elif (command == 'peloton' or command.startswith('peloton ')) and is_admin(current_user):
+                    if peloton_manager:
+                        reply = peloton_manager.chat_command(state, command[len('peloton'):])
+                    else:
+                        reply = 'No RoboPacers loaded (storage/robopacers)'
+                    send_message(reply, recipients=[chat_message.player_id])
                 elif command == 'position':
                     logger.info('course %s road %s isForward %s roadTime %s route %s' % (get_course(state), road_id(state), is_forward(state), state.roadTime, state.route))
                 elif command.startswith('bookmark') and len(command) > 9:
-                    save_bookmark(state, quote(command[9:], safe=' '))
+                    save_bookmark(state, secure_filename(command[9:]))
                     send_message('Bookmark saved', recipients=[chat_message.player_id])
                 else:
                     send_message('Invalid command: %s' % command, recipients=[chat_message.player_id])
@@ -3698,9 +4268,10 @@ def relay_worlds_leave(server_realm):
 def load_variants(file):
     vs = variants_pb2.FeatureResponse()
     try:
-        Parse(open(file).read(), vs)
+        with open(file) as f:
+            Parse(f.read(), vs)
     except Exception as exc:
-        logging.warning("load_variants: %s" % repr(exc))
+        logger.warning("load_variants: %s" % repr(exc))
     variants = {}
     for v in vs.variants:
         variants[v.name] = v
@@ -3716,6 +4287,7 @@ def create_variants_response(request, variants):
                 response.variants.append(variants[param])
             else:
                 logger.info("Unknown feature: " + param)
+                response.variants.add().name = param
     return response.SerializeToString(), 200
 
 @app.route('/experimentation/v1/variant', methods=['POST'])
@@ -3861,7 +4433,8 @@ def get_streaks(player_id):
             for field in ['cur_streak', 'cur_streak_distance', 'cur_streak_elevation', 'cur_streak_calories',
               'max_streak', 'max_streak_distance', 'max_streak_elevation', 'max_streak_calories']:
                 setattr(streaks, field, int(getattr(profile, field)))
-            streaks.week_end = int(get_week_range(datetime.datetime.fromtimestamp(profile.last_ride))[1].timestamp() * 1000)
+            streaks.week_end = int(get_week_range(datetime.datetime.fromtimestamp(profile.cur_streak_ride))[1].timestamp() * 1000)
+            streaks.cur_streak_ride = profile.cur_streak_ride * 1000
             with open(streaks_file, 'wb') as f:
                 f.write(streaks.SerializeToString())
     return streaks
@@ -3876,6 +4449,7 @@ def update_streaks(player_id, activity):
         streaks.cur_streak_calories = 0
     elif start_date > streaks.week_end:
         streaks.cur_streak += 1
+        streaks.cur_streak_ride = int(datetime.datetime.strptime(activity.start_date, '%Y-%m-%dT%H:%M:%S%z').timestamp() * 1000)
     streaks.cur_streak_distance += int(activity.distanceInMeters)
     streaks.cur_streak_elevation += int(activity.total_elevation)
     streaks.cur_streak_calories += int(activity.calories)
@@ -3893,13 +4467,36 @@ def update_streaks(player_id, activity):
 def api_fitness_streaks():
     return get_streaks(current_user.player_id).SerializeToString(), 200
 
-@app.route('/api/fitness/metrics-and-goals', methods=['GET'])  # TODO: fitnessScore, trainingStatus, numStreakSavers, givenXp, better default goals
+def ewma(player_id, date, days):
+    today = yesterday = 0
+    for i in range(days - 1, -1, -1):
+        day = date - datetime.timedelta(days=i)
+        stmt = sqlalchemy.text("SELECT SUM(tss) FROM activity WHERE player_id = :p AND strftime('%F', start_date) = strftime('%F', :d)")
+        row = db.session.execute(stmt, {"p": player_id, "d": day.isoformat()}).first()
+        tss = row[0] if row[0] else 0
+        yesterday = today
+        today = yesterday * math.e ** (-1 / days) + tss * (1 - math.e ** (-1 / days))
+    return today
+
+def training_status(fitness, form):
+    if fitness == 0:
+        return "READY"
+    status = fitness - form
+    if status < -30:
+        return "OVERREACHING"
+    if -30 <= status < 0:
+        return "PRODUCTIVE"
+    if 0 <= status < 25:
+        return "FRESH"
+    return "DETRAINING"
+
+@app.route('/api/fitness/metrics-and-goals', methods=['GET'])  # TODO: numStreakSavers, givenXp, better default goals
 @jwt_to_session_cookie
 @login_required
 def api_fitness_metrics_and_goals():
     if request.headers['Accept'] == 'application/json':
         try:
-            date = datetime.datetime.strptime(request.args.get('month') + request.args.get('weekOf') + request.args.get('year'), "%m%d%Y")
+            date = datetime.datetime.strptime("%s-%s-%s 00:00:00+00:00" % (request.args.get('year'), request.args.get('month'), request.args.get('weekOf')), "%Y-%m-%d %H:%M:%S%z")
         except:
             return '', 404
         fitness = {"fitnessMetrics": []}
@@ -3907,17 +4504,20 @@ def api_fitness_metrics_and_goals():
             start, end = get_week_range(date - datetime.timedelta(days=i * 7))
             stmt = sqlalchemy.text("""SELECT SUM(distanceInMeters), SUM(total_elevation), SUM(movingTimeInMs), SUM(work), SUM(calories), SUM(tss)
                 FROM activity WHERE player_id = :p AND strftime('%s', start_date) >= strftime('%s', :s) AND strftime('%s', start_date) <= strftime('%s', :e)""")
-            row = db.session.execute(stmt, {"p": current_user.player_id, "s": start, "e": end}).first()
-            week = {"startOfWeek": start.strftime('%Y-%m-%d'), "fitnessScore": 0, "totalDistanceKilometers": row[0] / 1000 if row[0] else 0,
+            row = db.session.execute(stmt, {"p": current_user.player_id, "s": start.isoformat(), "e": end.isoformat()}).first()
+            week = {"startOfWeek": start.strftime('%Y-%m-%d'), "totalDistanceKilometers": row[0] / 1000 if row[0] else 0,
                 "totalElevationMeters": int(row[1]) if row[1] else 0, "totalDurationMinutes": int(row[2] / 60000) if row[2] else 0,
                 "totalKilojoules": int(row[3]) if row[3] else 0, "totalCalories": int(row[4]) if row[4] else 0,
                 "totalTSS": row[5] if row[5] else 0, "useMetric": get_partial_profile(current_user.player_id).use_metric,
-                "weekStreak": get_streaks(current_user.player_id).cur_streak, "numStreakSavers": 0, "days": {}, "trainingStatus": "FRESH"}
+                "weekStreak": get_streaks(current_user.player_id).cur_streak, "numStreakSavers": 0, "days": {}}
+            end_date = end if end < datetime.datetime.now(datetime.timezone.utc) else datetime.datetime.now(datetime.timezone.utc)
+            week["fitnessScore"] = ewma(current_user.player_id, end_date, 42)
+            week["trainingStatus"] = training_status(week["fitnessScore"], ewma(current_user.player_id, end_date, 7))
             for i in range(0, 7):
                 day = start + datetime.timedelta(days=i)
                 stmt = sqlalchemy.text("""SELECT SUM(distanceInMeters), SUM(total_elevation), SUM(movingTimeInMs), SUM(work), SUM(calories), SUM(tss)
                     FROM activity WHERE player_id = :p AND strftime('%F', start_date) = strftime('%F', :d)""")
-                row = db.session.execute(stmt, {"p": current_user.player_id, "d": day}).first()
+                row = db.session.execute(stmt, {"p": current_user.player_id, "d": day.isoformat()}).first()
                 if row[0]:
                     d = {"day": day.strftime('%a').lower(), "distanceKilometers": row[0] / 1000, "elevationMeters": int(row[1]) if row[1] else 0,
                         "durationMinutes": int(row[2] / 60000) if row[2] else 0, "kilojoules": int(row[3]) if row[3] else 0,
@@ -3925,7 +4525,7 @@ def api_fitness_metrics_and_goals():
                         "powerZonePercentages": {"1": 1, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0, "7": 0}, "givenXp": 0}
                     zones = [0] * 7
                     stmt = sqlalchemy.text("SELECT power_zones FROM activity WHERE player_id = :p AND strftime('%F', start_date) = strftime('%F', :d)")
-                    for row in db.session.execute(stmt, {"p": current_user.player_id, "d": day}):
+                    for row in db.session.execute(stmt, {"p": current_user.player_id, "d": day.isoformat()}):
                         if row.power_zones:
                             zones = [a + b for a, b in zip(zones, json.loads(row.power_zones))]
                     total = sum(zones)
@@ -3950,20 +4550,21 @@ def api_fitness_metrics_and_goals():
             week.start = start.strftime('%Y-%m-%d')
             stmt = sqlalchemy.text("""SELECT SUM(distanceInMeters), SUM(total_elevation), SUM(movingTimeInMs), SUM(work), SUM(calories), SUM(tss)
                 FROM activity WHERE player_id = :p AND strftime('%s', start_date) >= strftime('%s', :s) AND strftime('%s', start_date) <= strftime('%s', :e)""")
-            row = db.session.execute(stmt, {"p": current_user.player_id, "s": start, "e": end}).first()
-            week.fitness_score = 0
+            row = db.session.execute(stmt, {"p": current_user.player_id, "s": start.isoformat(), "e": end.isoformat()}).first()
+            end_date = end if end < datetime.datetime.now(datetime.timezone.utc) else datetime.datetime.now(datetime.timezone.utc)
+            week.fitness_score = ewma(current_user.player_id, end_date, 42)
+            week.status = training_status(week.fitness_score, ewma(current_user.player_id, end_date, 7))
             week.distance = int(row[0]) if row[0] else 0
             week.elevation = int(row[1]) if row[1] else 0
             week.moving_time = int(round(row[2], -4)) if row[2] else 0
             week.work = int(row[3]) if row[3] else 0
             week.calories = int(row[4]) if row[4] else 0
             week.tss = row[5] if row[5] else 0
-            week.status = "FRESH"
             for i in range(0, 7):
                 day = start + datetime.timedelta(days=i)
                 stmt = sqlalchemy.text("""SELECT SUM(distanceInMeters), SUM(total_elevation), SUM(movingTimeInMs), SUM(work), SUM(calories), SUM(tss)
                     FROM activity WHERE player_id = :p AND strftime('%F', start_date) = strftime('%F', :d)""")
-                row = db.session.execute(stmt, {"p": current_user.player_id, "d": day}).first()
+                row = db.session.execute(stmt, {"p": current_user.player_id, "d": day.isoformat()}).first()
                 if row[0]:
                     d = week.days.add()
                     d.day = day.strftime('%a').lower()
@@ -3975,7 +4576,7 @@ def api_fitness_metrics_and_goals():
                     d.tss = row[5] if row[5] else 0
                     zones = [0] * 7
                     stmt = sqlalchemy.text("SELECT power_zones FROM activity WHERE player_id = :p AND strftime('%F', start_date) = strftime('%F', :d)")
-                    for row in db.session.execute(stmt, {"p": current_user.player_id, "d": day}):
+                    for row in db.session.execute(stmt, {"p": current_user.player_id, "d": day.isoformat()}):
                         if row.power_zones:
                             zones = [a + b for a, b in zip(zones, json.loads(row.power_zones))]
                     total = sum(zones)
@@ -4005,6 +4606,23 @@ def api_fitness_fitness_goals_history():
     goals["lastUpdated"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + 'Z'
     db.session.add(GoalMetrics(**goals))
     db.session.commit()
+    return '', 204
+
+
+@app.route('/api/d-lock-service/device/authenticate', methods=['POST'])
+@jwt_to_session_cookie
+@login_required
+def api_d_lock_service_device_authenticate():
+    tokens = get_zwift_online_tokens(current_user.player_id)
+    if tokens['access_token'] and os.path.isfile("%s/%s/zwift_click.txt" % (STORAGE_DIR, current_user.player_id)):
+        headers = dict(request.headers)
+        headers['Authorization'] = "Bearer %s" % tokens['access_token']
+        with requests.session() as session:
+            try:
+                response = session.post(url="https://us-or-rly101.zwift.com/api/d-lock-service/device/authenticate", headers=headers, data=request.stream.read())
+                return response.content, response.status_code
+            except Exception as exc:
+                logger.warning("api_d_lock_service_device_authenticate: %s" % repr(exc))
     return '', 204
 
 
@@ -4185,6 +4803,7 @@ with app.app_context():
     if check_columns(Playback, 'playback'):
         update_playback()
     check_columns(RouteResult, 'route_result')
+    check_columns(GoalMetrics, 'goal_metrics')
     migrate_database()
     db.session.close()
 
@@ -4216,8 +4835,7 @@ def launch_zwift():
         if MULTIPLAYER:
             return redirect(url_for('login'))
         else:
-            return render_template("user_home.html", username=current_user.username, enable_ghosts=os.path.exists(ENABLEGHOSTS_FILE), online=get_online(),
-                climbs=CLIMBS, is_admin=False, restarting=restarting, restarting_in_minutes=restarting_in_minutes)
+            return redirect(url_for('user_home', username=current_user.username))
     else:
         if MULTIPLAYER:
             return redirect("http://zwift/?code=zwift_refresh_token%s" % fake_refresh_token_with_session_cookie(request.cookies.get('remember_token')), 302)
@@ -4320,6 +4938,16 @@ def start_zwift():
     return redirect("/ride", 302)
 
 
+class CleanWSGIServer(WSGIServer):
+    def wrap_socket_and_handle(self, client_socket, address):
+        try:
+            super().wrap_socket_and_handle(client_socket, address)
+        except ssl.SSLError:
+            pass  # Suppress log spam caused by Launcher 1.1.17
+        except ConnectionResetError:
+            logger.warning('WSGIServer: connection reset by client (missing certificate in cacert.pem?)')
+
+
 def run_standalone(passed_online, passed_global_relay, passed_global_pace_partners, passed_global_bots, passed_global_ghosts, passed_regroup_ghosts, passed_discord):
     global online
     global global_relay
@@ -4368,18 +4996,19 @@ def run_standalone(passed_online, passed_global_relay, passed_global_pace_partne
     remove_inactive_thread = threading.Thread(target=remove_inactive)
     remove_inactive_thread.start()
     logger.info("Server version %s is running." % ZWIFT_VER_CUR)
-    host = os.environ.get('ZOFFLINE_API_HOST', '0.0.0.0')
+    SERVER_HOST = os.environ.get('ZOFFLINE_SERVER_HOST', '0.0.0.0')
+    host = os.environ.get('ZOFFLINE_API_HOST', SERVER_HOST)
     port = int(os.environ.get('ZOFFLINE_API_PORT', 443))
     use_cert = os.environ.get('ZOFFLINE_API_USE_CERT', 'true').lower() == 'true'
-    if host != '0.0.0.0' or port != 443 or not use_cert:
+    if host != SERVER_HOST or port != 443 or not use_cert:
         logger.info("Listening on %s:%d using certificate: %s", host, port, use_cert)
-    cert_kwargs = {'certfile': '%s/cert-zwift-com.pem' % SSL_DIR, 'keyfile': '%s/key-zwift-com.pem' % SSL_DIR}
-    if not use_cert:
-        cert_kwargs = {}
-    server = WSGIServer((host, port), app, log=logger, **cert_kwargs)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    if use_cert:
+        context.load_cert_chain(certfile='%s/cert-zwift-com.pem' % SSL_DIR, keyfile='%s/key-zwift-com.pem' % SSL_DIR)
+    server = CleanWSGIServer((host, port), app, log=logger, ssl_context=context)
     server.serve_forever()
 
-#    app.run(ssl_context=('%s/cert-zwift-com.pem' % SSL_DIR, '%s/key-zwift-com.pem' % SSL_DIR), port=443, threaded=True, host='0.0.0.0') # debug=True, use_reload=False)
+#    app.run(ssl_context=('%s/cert-zwift-com.pem' % SSL_DIR, '%s/key-zwift-com.pem' % SSL_DIR), port=443, threaded=True, host=SERVER_HOST) # debug=True, use_reload=False)
 
 
 if __name__ == "__main__":

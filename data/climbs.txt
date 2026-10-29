@@ -1,5 +1,9 @@
 [
   {
+    "name": "Alto de Patios (5.9 km / 376 m)",
+    "road": "10052"
+  },
+  {
     "name": "Bealach na Ba (9 km / 632 m)",
     "road": "10011"
   },
@@ -28,12 +32,20 @@
     "road": "10033"
   },
   {
+    "name": "Col de Sarenne (12.8 km / 922 m)",
+    "road": "10056"
+  },
+  {
     "name": "Col de la Couillole (18.1 km / 1202 m)",
     "road": "10025"
   },
   {
     "name": "Col de la Croix Saint-Robert (5.7 km / 345 m)",
     "road": "10047"
+  },
+  {
+    "name": "Col de la Croix de Fer (27.1 km / 1557 m)",
+    "road": "10053"
   },
   {
     "name": "Col de la Madeleine (14.3 km / 1110 m)",
@@ -52,6 +64,10 @@
     "road": "10032"
   },
   {
+    "name": "Col du Galibier (Valloire) (17.9 km / 1223 m)",
+    "road": "10055"
+  },
+  {
     "name": "Col du Platzerwasel (7.9 km / 596 m)",
     "road": "10008"
   },
@@ -62,6 +78,10 @@
   {
     "name": "Col du Tourmalet (17.1 km / 1216 m)",
     "road": "10010"
+  },
+  {
+    "name": "Col du T\u00e9l\u00e9graphe (11.9 km / 844 m)",
+    "road": "10054"
   },
   {
     "name": "Coll d'Ordino (10.3 km / 505 m)",
@@ -112,6 +132,10 @@
     "road": "10030"
   },
   {
+    "name": "Koppenberg (0.6 km / 63 m)",
+    "road": "10050"
+  },
+  {
     "name": "La Laguna Negra (9.1 km / 509 m)",
     "road": "10014"
   },
@@ -140,6 +164,10 @@
     "road": "10036"
   },
   {
+    "name": "Mur de Huy (1.3 km / 123 m)",
+    "road": "10049"
+  },
+  {
     "name": "M\u00fbr De Bretagne (2 km / 128 m)",
     "road": "10045"
   },
@@ -166,6 +194,10 @@
   {
     "name": "Passo dello Stelvio (23.4 km / 1596 m)",
     "road": "10024"
+  },
+  {
+    "name": "Paterberg (0.4 km / 45 m)",
+    "road": "10051"
   },
   {
     "name": "Pla d'Adet (12.1 km / 847 m)",

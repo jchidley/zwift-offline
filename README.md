@@ -1,5 +1,16 @@
 # zoffline
 
+## Upstream repositories
+
+This fork follows [fatsbrown/zwift-offline](https://github.com/fatsbrown/zwift-offline) as its active upstream. The deprecated original, [zoffline/zwift-offline](https://github.com/zoffline/zwift-offline), remains a reference in case development resumes.
+
+For a fresh clone of this fork, configure both remotes with:
+
+```sh
+git remote add upstream https://github.com/fatsbrown/zwift-offline.git
+git remote add legacy-upstream https://github.com/zoffline/zwift-offline.git
+```
+
 zoffline enables the use of [Zwift](http://zwift.com) offline by acting as a partial implementation of a Zwift server. By default zoffline is only for a single player. See [Step 6: Enable Multiplayer](#step-6-optional-enable-multiplayer) for how to enable support for multiple users/profiles.
 
 zoffline also offers riding against ghosts (your previous rides). Enable this feature by checking "Enable ghosts" in zoffline's launcher. See [Extra features](#extra-features) for more details.
